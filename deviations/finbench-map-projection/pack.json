@@ -1,0 +1,19 @@
+{
+  "engines": [
+    "graphdblite",
+    "ladybug",
+    "kuzu",
+    "ryugraph"
+  ],
+  "queries": [
+    {
+      "suite": "finbench",
+      "op": "TSR1",
+      "file": "TSR1.cypher",
+      "canonical_sha256": "4a3bb64e9953b2a861c890f47943bc3277c94e3213231ff26c1e83f6aa9c5e89",
+      "sha256": "06eb04a93b06ed8cdde93e351d6ac641b2a5c6fd960926fcf6d0f0ffe8362764",
+      "reason": "GraphDBLite and the typed K\u00f9zu-family engines reject the reference map-projection syntax. Return a literal map with the same fields instead.",
+      "validation": "The FinBench smoke case compares the complete map against the source Account row."
+    }
+  ]
+}

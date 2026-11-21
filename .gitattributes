@@ -1,0 +1,3 @@
+# Preserve the bytes checked by queries/sources.json and the deviation manifests.
+queries/**/*.cypher -text diff
+deviations/**/*.cypher -text diff

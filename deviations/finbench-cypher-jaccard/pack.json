@@ -1,0 +1,23 @@
+{
+  "engines": [
+    "velr",
+    "relate",
+    "ladybug",
+    "kuzu",
+    "grafeo",
+    "arcadedb",
+    "graphdblite",
+    "ryugraph"
+  ],
+  "queries": [
+    {
+      "suite": "finbench",
+      "op": "TCR10",
+      "file": "TCR10.cypher",
+      "canonical_sha256": "6603e6f1d2a444769edccc056e2bf1563c2a370a27c9ad8de0538dcd8b5b0efe",
+      "sha256": "d71de67aee4bb52f792d7f718baaab8c78a8a23f009a3211f05955b1651c9928",
+      "reason": "Replace the Neo4j GDS Jaccard function with intersection and union counts in Cypher, including the specification\u2019s zero result for empty investment sets.",
+      "validation": "See the Jaccard fixture and its per-engine outcomes in the deviations documentation."
+    }
+  ]
+}

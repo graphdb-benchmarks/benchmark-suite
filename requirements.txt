@@ -1,0 +1,8 @@
+velr==0.2.64
+relate-db==1.2.0
+ladybug==0.22.3
+kuzu==0.11.3
+grafeo==0.6.3
+arcadedb==26.11.1.post4
+graphdblite==0.2.0
+ryugraph==25.9.2

@@ -1,0 +1,62 @@
+# Default locations for downloaded data, extracted fixtures, and benchmark runs
+/data/
+/results/
+
+# Benchmark downloads and extracted datasets under custom data roots
+snb-fixture.tar.gz
+social_network-sf*.tar.zst
+substitution_parameters-sf*.tar.zst
+finbench-sf*.tar.gz
+finbench-sf*_read_params.zip
+**/snb/sf[0-9]*/
+**/finbench/sf[0-9]*/
+**/fixtures/snb/converted/
+**/fixtures/snb/substitution_parameters/
+**/fixtures/snb/update_streams/
+**/fixtures/snb/vanilla/
+
+# Benchmark reports, case lists, and logs written to custom output directories
+run.json
+matrix.json
+summary.jsonl
+matrix-summary.jsonl
+cases.jsonl
+*.cases.jsonl
+arcadedb.jsonl
+grafeo.jsonl
+graphdblite.jsonl
+kuzu.jsonl
+ladybug.jsonl
+relate.jsonl
+ryugraph.jsonl
+velr.jsonl
+*.log
+
+# Database stores and staging files left by interrupted runs
+**/*-????????/database
+**/*-????????/database.*
+**/*-????????/database-*
+**/velr-????????/empty
+**/velr-????????/empty.*
+**/velr-????????/empty-*
+velr-csv-????????/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.wal
+
+# Build output and Python package metadata
+build/
+dist/
+target/
+*.egg-info/
+
+# Local Python setup, test caches, and OS metadata
+/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store

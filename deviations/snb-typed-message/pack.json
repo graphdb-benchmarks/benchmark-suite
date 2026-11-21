@@ -1,0 +1,81 @@
+{
+  "engines": [
+    "ladybug",
+    "kuzu",
+    "ryugraph"
+  ],
+  "queries": [
+    {
+      "suite": "snb",
+      "op": "IC2",
+      "file": "IC2.cypher",
+      "canonical_sha256": "434d4215e299eb00fa4d0bfc9a5111b00f1a806c7b8220044df7963da3f06de2",
+      "sha256": "4a13038c50d4cae72115792d4367e5d7e4b4f863a3e93d6be29f6b19eb66ebc4",
+      "reason": "The typed SNB schema stores Post and Comment in separate tables. In MATCH, this dialect interprets successive table labels as a union.",
+      "validation": "Checked that the union selects both table types. IS4 has a dataset-derived result oracle in the fixture. Full-scale equivalence is pending."
+    },
+    {
+      "suite": "snb",
+      "op": "IC7",
+      "file": "IC7.cypher",
+      "canonical_sha256": "691a4e3ee8f36053a19e7c615327b51102df43d81b2309b6052cc5ce810aec7d",
+      "sha256": "07da2244bac31cc8fee1b58da4b9895e048f5c9baf63aa7cc385c6a239607f6a",
+      "reason": "The typed SNB schema stores Post and Comment in separate tables. In MATCH, this dialect interprets successive table labels as a union.",
+      "validation": "Checked that the union selects both table types. IS4 has a dataset-derived result oracle in the fixture. Full-scale equivalence is pending."
+    },
+    {
+      "suite": "snb",
+      "op": "IC8",
+      "file": "IC8.cypher",
+      "canonical_sha256": "d393a6d23e5162a4894a4629f9cc18aed69f61c1e6f683b04a2630a26135c357",
+      "sha256": "60a0ee81f5a3fd99976ee63f0159685e37db3fdf58e07abfe75e89ae255f7e20",
+      "reason": "The typed SNB schema stores Post and Comment in separate tables. In MATCH, this dialect interprets successive table labels as a union.",
+      "validation": "Checked that the union selects both table types. IS4 has a dataset-derived result oracle in the fixture. Full-scale equivalence is pending."
+    },
+    {
+      "suite": "snb",
+      "op": "IC9",
+      "file": "IC9.cypher",
+      "canonical_sha256": "84d05a4cc87a0680b490fc98aa303ff211f363204cc81d936cd5d442bf85cfe7",
+      "sha256": "34cac1667f9661452445c3e3af4fe97be9741d4417e9969d8acc5db0b74782ad",
+      "reason": "The typed SNB schema stores Post and Comment in separate tables. In MATCH, this dialect interprets successive table labels as a union.",
+      "validation": "Checked that the union selects both table types. IS4 has a dataset-derived result oracle in the fixture. Full-scale equivalence is pending."
+    },
+    {
+      "suite": "snb",
+      "op": "IS4",
+      "file": "IS4.cypher",
+      "canonical_sha256": "b579231518cf36352fe0237f4a36bbce5a9a96a0763565b8e17e07d9b0704642",
+      "sha256": "1a1b678966a525b183a1732da81110b316cc3d094e5c5bc040e5f1ebcd9d6bcc",
+      "reason": "The typed SNB schema stores Post and Comment in separate tables. In MATCH, this dialect interprets successive table labels as a union.",
+      "validation": "Checked that the union selects both table types. IS4 has a dataset-derived result oracle in the fixture. Full-scale equivalence is pending."
+    },
+    {
+      "suite": "snb",
+      "op": "IS5",
+      "file": "IS5.cypher",
+      "canonical_sha256": "28d461db14b3817cfe00140fbabc7f7af796a2661b8c2492d8cf950ffce40fcd",
+      "sha256": "5b537f9380ea0774c653bb03127c84679c808bd300ce45fe21e293125c65bb58",
+      "reason": "The typed SNB schema stores Post and Comment in separate tables. In MATCH, this dialect interprets successive table labels as a union.",
+      "validation": "Checked that the union selects both table types. IS4 has a dataset-derived result oracle in the fixture. Full-scale equivalence is pending."
+    },
+    {
+      "suite": "snb",
+      "op": "IS6",
+      "file": "IS6.cypher",
+      "canonical_sha256": "1ac9125f6817402cd5df456b5201fc44187b646ffe6bf8497070db2abae84bce",
+      "sha256": "6177347bf652208783708620b17871f1b1d74182f1984b6c903b73632c3065e0",
+      "reason": "The typed SNB schema stores Post and Comment in separate tables. In MATCH, this dialect interprets successive table labels as a union.",
+      "validation": "Checked that the union selects both table types. IS4 has a dataset-derived result oracle in the fixture. Full-scale equivalence is pending."
+    },
+    {
+      "suite": "snb",
+      "op": "IS7",
+      "file": "IS7.cypher",
+      "canonical_sha256": "7ac858ff9f60f84dfe9833f1f8285cbd2b58cd4834d8eccb2d4beaf7f41656a7",
+      "sha256": "90bab2848911efe1a66d7b671a69494407313cbafd83ec761db9228845436a66",
+      "reason": "The typed SNB schema stores Post and Comment in separate tables. In MATCH, this dialect interprets successive table labels as a union.",
+      "validation": "Checked that the union selects both table types. IS4 has a dataset-derived result oracle in the fixture. Full-scale equivalence is pending."
+    }
+  ]
+}
