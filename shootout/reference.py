@@ -6,7 +6,7 @@ from urllib.request import Request, urlopen
 
 from .catalog import load
 from .run import bind, cases, describe_case
-from .verification import answer_rows, equal_rows
+from .verification import answer_rows, equal_rows, read_case_key
 
 
 def neo4j_rows(endpoint, query, params=None):
@@ -29,28 +29,36 @@ def build_reference(args):
     if (node_count, edge_count) != (args.nodes, args.relationships):
         raise ValueError(f"Neo4j snapshot counts differ from the requested snapshot: {node_count} nodes, {edge_count} edges")
     answers = []
+    unique = {}
+    repeated = False
     for number, item in cases(args.cases):
         event, query = describe_case(suite, queries, number, item)
         if event.get("status") == "omitted":
             continue
         if query is None or query.kind != "read":
             raise ValueError(f"Reference generation requires a read-only schedule (case {number})")
+        key = read_case_key(item)
         try:
-            rows = neo4j_rows(endpoint, query.text, bind(query, item["params"]))
+            rows = unique[key] if key in unique else neo4j_rows(endpoint, query.text, bind(query, item["params"]))
         except ValueError as error:
             raise ValueError(f"Case {number} ({query.operation}): {error}") from error
         if not answer_rows(rows) or ("expected" in item and not equal_rows(
             rows, item["expected"], item.get("unordered", False), suite=suite, operation=query.operation,
         )):
             raise ValueError(f"Reference contradicts the source-data answer for case {number} ({query.operation})")
-        answers.append({"case": number, "op": query.operation, "canonical_sha256": query.upstream_sha256, "rows": rows})
-        print(f"Reference {number} {query.operation}: {len(rows)} rows", flush=True)
+        if key in unique:
+            repeated = True
+        else:
+            unique[key] = rows
+            answers.append({"case": number, "op": query.operation, "canonical_sha256": query.upstream_sha256, "rows": rows})
+            print(f"Reference {number} {query.operation}: {len(rows)} rows", flush=True)
     if not answers:
         raise ValueError("No SNB reads to validate")
     with args.archive.open("rb") as stream:
         archive_sha = file_digest(stream, "sha256").hexdigest()
     pack = {
-        "format": 1, "suite": suite, "scale": args.scale, "cases_sha256": sha256(args.cases.read_bytes()).hexdigest(),
+        "format": 2 if repeated else 1, "suite": suite, "scale": args.scale,
+        "cases_sha256": sha256(args.cases.read_bytes()).hexdigest(),
         "source": {"engine": "Neo4j", "version": version[0], "edition": edition, "nodes": node_count,
                    "relationships": edge_count, "archive": args.archive.name, "archive_sha256": archive_sha},
         "answers": answers,

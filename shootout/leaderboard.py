@@ -3,16 +3,17 @@
 import argparse
 from html import escape
 import json
+from math import fsum, log, prod
 from pathlib import Path
+from statistics import geometric_mean
 
-from .chart import NAMES, latency_label, read_schedule, read_workload, rss_label
+from .chart import NAMES, cpu_description, latency_label, read_schedule, read_workload, rss_label
 from .engines import ENGINES
 
-CRITERIA = ("correct", "under_latency_target", "p99_under_25_ms")
-COLORS = ("#265991", "#127467", "#9b4c22")
-DEFAULT_LATENCY_TARGET_MS = 250
-NS_PER_MS = 1_000_000
-FAST_RESPONSE_MS = 25
+MAX_POINTS_PER_OPERATION = 3
+ZERO_LATENCY_SCORE_NS = 2_500_000_000
+FULL_LATENCY_SCORE_NS = 15_000_000
+LOG_LATENCY_RANGE = log(ZERO_LATENCY_SCORE_NS / FULL_LATENCY_SCORE_NS)
 
 
 def load_cohort(directories, reference, excluded):
@@ -33,12 +34,17 @@ def load_cohort(directories, reference, excluded):
     return report, settings["cases_sha256"]
 
 
-def score_workload(report, *, latency_target_ms=DEFAULT_LATENCY_TARGET_MS):
-    threshold_ns = latency_target_ms * NS_PER_MS
-    fast_response_ns = FAST_RESPONSE_MS * NS_PER_MS
-    weights = dict.fromkeys(CRITERIA, 1)
-    recorded = {engine["name"]: engine["cases"] for engine in report["engines"]}
-    totals = {engine["name"]: dict.fromkeys(CRITERIA, 0) for engine in report["engines"]}
+def scoring_latency(p99_ns):
+    if p99_ns is None:
+        return ZERO_LATENCY_SCORE_NS
+    return min(ZERO_LATENCY_SCORE_NS, max(FULL_LATENCY_SCORE_NS, p99_ns))
+
+
+def score_workload(report):
+    engines = {engine["name"]: engine for engine in report["engines"]}
+    scores = {name: [] for name in engines}
+    common_operations = []
+    common_p99s = {name: [] for name in engines}
     categories = {}
     case_count = 0
     for operation, rows in report["aggregates"].items():
@@ -48,46 +54,57 @@ def score_workload(report, *, latency_target_ms=DEFAULT_LATENCY_TARGET_MS):
         case_count += len(numbers)
         entries = []
         for row in rows:
-            engine = row["engine"]
+            name = row["engine"]
             correct = row["outcomes"]["pass"] == row["cases"]
-            durations = sorted(recorded[engine][number]["duration_ns"] for number in numbers) if correct else []
+            recorded = engines[name]["cases"]
+            durations = sorted(recorded[number]["duration_ns"] for number in numbers) if correct else []
             p99 = durations[(99 * len(durations) - 1) // 100] if durations else None
-            earned = {
-                "correct": correct,
-                "under_latency_target": p99 is not None and p99 < threshold_ns,
-                "p99_under_25_ms": p99 is not None and p99 < fast_response_ns,
-            }
-            points = {criterion: int(earns) for criterion, earns in earned.items()}
-            for criterion, value in points.items():
-                totals[engine][criterion] += value
-            entries.append({**row, "points": points, "total": sum(points.values()), "p99_ns": p99})
+            fraction = log(ZERO_LATENCY_SCORE_NS / scoring_latency(p99)) / LOG_LATENCY_RANGE
+            entry = {**row, "total": MAX_POINTS_PER_OPERATION * fraction, "p99_ns": p99}
+            scores[name].append(entry)
+            entries.append(entry)
+        if all(row["p99_ns"] is not None for row in entries):
+            common_operations.append(operation)
+            for row in entries:
+                common_p99s[row["engine"]].append(row["p99_ns"])
         categories[operation] = entries
 
+    # A sum of logarithms ranks by the corresponding integer product, so exact ties stay tied.
+    ranking = sorted((prod(scoring_latency(row["p99_ns"]) for row in rows), name) for name, rows in scores.items())
     standings = []
-    for engine in report["engines"]:
-        name = engine["name"]
-        points = totals[name]
-        standings.append({"engine": name, "version": engine["version"], "source": engine["directory"],
-                          "deployment": engine.get("deployment", "embedded"),
-                          "points": points, "total": sum(points.values())})
-    standings.sort(key=lambda row: (-row["total"], row["engine"]))
     previous = None
-    for index, row in enumerate(standings, 1):
-        if row["total"] != previous:
+    for index, (product, name) in enumerate(ranking, 1):
+        if product != previous:
             rank = index
-        row["rank"] = rank
-        previous = row["total"]
+        previous = product
+        engine = engines[name]
+        p99s = common_p99s[name]
+        shared_p99 = None
+        if p99s:
+            shared_p99 = round(geometric_mean(p99s)) if all(p99s) else 0
+        standings.append({"rank": rank, "engine": name, "version": engine["version"], "source": engine["directory"],
+                          "deployment": engine.get("deployment", "embedded"),
+                          "query_packs": engine.get("query_packs", []), "engine_settings": engine.get("engine_settings", {}),
+                          "verified_operations": sum(row["p99_ns"] is not None for row in scores[name]),
+                          "total": fsum(row["total"] for row in scores[name]),
+                          "common_geomean_p99_ns": shared_p99})
     host = next((engine for engine in report["engines"] if engine.get("platform")), {})
     return {"workload": report["workload"], "reference": report["reference"],
+            **({"cpu_ids": report["cpu_ids"]} if "cpu_ids" in report else {}),
             "deadline_seconds": report["deadline_seconds"], "rss_limit_bytes": report["rss_limit_bytes"],
             "platform": host.get("platform"), "python": host.get("python"),
-            "threshold_ns": threshold_ns,
-            "fast_response_threshold_ns": fast_response_ns, "case_count": case_count,
-            "weights": weights, "max_points": len(categories) * sum(weights.values()),
-            "standings": standings, "categories": categories}
+            "scoring": "logarithmic_p99", "zero_latency_score_ns": ZERO_LATENCY_SCORE_NS,
+            "full_latency_score_ns": FULL_LATENCY_SCORE_NS, "case_count": case_count,
+            "max_points_per_operation": MAX_POINTS_PER_OPERATION,
+            "max_points": len(categories) * MAX_POINTS_PER_OPERATION,
+            "standings": standings, "categories": categories, "common_operations": common_operations}
 
 
-def score_chart(score, labels):
+def points_label(value):
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
+def score_chart(score):
     left, top, bottom, step = 42, 26, 224, 108
     width = left + step * len(score["standings"]) + 20
     maximum = score["max_points"]
@@ -97,27 +114,24 @@ def score_chart(score, labels):
     def y(points):
         return bottom - (bottom - top) * points / maximum
 
-    svg = [f'<svg viewBox="0 0 {width} 267" width="{width}" role="img" aria-label="Total and component points by engine">']
+    svg = [f'<svg viewBox="0 0 {width} 267" width="{width}" role="img" aria-label="Total points by engine">']
     for points in sorted({maximum * i // 4 for i in range(5)}):
         svg.append(f'<path d="M {left} {y(points):.2f} H {width - 12}" stroke="#d8e2df"/>'
                    f'<text x="{left - 8}" y="{y(points) + 4:.2f}" text-anchor="end">{points}</text>')
     for index, row in enumerate(score["standings"]):
         name = NAMES[row["engine"]]
         x = left + (index + 0.5) * step
-        height = bottom
-        for criterion, label, color in zip(CRITERIA, labels, COLORS, strict=True):
-            value = row["points"][criterion]
-            if value:
-                size = (bottom - top) * value / maximum
-                height -= size
-                svg.append(f'<rect x="{x - 26:.1f}" y="{height:.2f}" width="52" height="{size:.2f}" fill="{color}">'
-                           f'<title>{name} · {label} · {value} points</title></rect>')
-        svg.append(f'<text x="{x:.1f}" y="{y(row["total"]) - 8:.2f}" text-anchor="middle" class="total">{row["total"]}</text>'
+        bar_top = y(row["total"])
+        points = points_label(row["total"])
+        if row["total"]:
+            svg.append(f'<rect x="{x - 26:.1f}" y="{bar_top:.2f}" width="52" height="{bottom - bar_top:.2f}" fill="#265991">'
+                       f'<title>{name} · {points} points</title></rect>')
+        svg.append(f'<text x="{x:.1f}" y="{bar_top - 8:.2f}" text-anchor="middle" class="total">{points}</text>'
                    f'<text x="{x:.1f}" y="249" text-anchor="middle">{name}</text>')
     return "".join([*svg, "</svg>"])
 
 
-def render_cohort(score, labels, anchor):
+def render_cohort(score, anchor):
     heading = escape(score.get("cohort", "Total points"))
     evidence = ""
     if score.get("platform"):
@@ -127,9 +141,12 @@ def render_cohort(score, labels, anchor):
     standings = []
     for row in score["standings"]:
         name = f'{NAMES[row["engine"]]} {row["version"] or ""}'.strip()
-        points = "".join(f'<td>{row["points"][key]}</td>' for key in CRITERIA)
+        shared_p99 = row["common_geomean_p99_ns"]
+        geometric_p99 = latency_label(shared_p99) if shared_p99 is not None else "—"
+        packs = escape(", ".join(row["query_packs"]) or "Canonical")
         standings.append(f'<tr><th scope="row">{row["rank"]}</th><td>{escape(name)}</td><td>{escape(row["deployment"])}</td>'
-                         f'<td class="total">{row["total"]}</td>{points}</tr>')
+                         f'<td>{packs}</td><td class="total">{points_label(row["total"])}</td>'
+                         f'<td>{row["verified_operations"]}/{len(score["categories"])}</td><td>{geometric_p99}</td></tr>')
     details = []
     for operation, rows in score["categories"].items():
         entries = []
@@ -138,34 +155,37 @@ def render_cohort(score, labels, anchor):
             time = latency_label(row["median_verified_ns"]) if row["median_verified_ns"] is not None else "—"
             p99 = latency_label(row["p99_ns"]) if row["p99_ns"] is not None else "—"
             peak = rss_label(row["peak_query_rss_bytes"]) if row["peak_query_rss_bytes"] is not None else "—"
-            breakdown = ", ".join(label for key, label in zip(CRITERIA, labels, strict=True) if row["points"][key]) or "—"
-            entries.append(f'<tr><th scope="row">{NAMES[row["engine"]]}</th><td>{counts["pass"]}/{row["cases"]}</td>'
-                           f'<td>{p99}</td><td>{time}</td><td>{peak} ({row["rss_cases"]}/{row["cases"]})</td>'
-                           f'<td>{row["total"]}</td><td>{breakdown}</td></tr>')
-        details.append(f'<details><summary>{escape(operation)}</summary><table><thead><tr><th>Engine</th><th>Passed</th>'
-                       '<th>Correct category p99</th><th>Verified median</th><th>Peak RSS (coverage)</th>'
-                       f'<th>Points</th><th>Criteria earned</th></tr></thead>'
+            packs = escape(", ".join(row.get("query_packs", ())) or "Canonical")
+            entries.append(f'<tr><th scope="row">{NAMES[row["engine"]]}</th><td>{packs}</td><td>{counts["pass"]}/{row["cases"]}</td>'
+                           f'<td>{counts["timeout"]}</td><td>{p99}</td><td>{time}</td>'
+                           f'<td>{peak} ({row["rss_cases"]}/{row["cases"]})</td>'
+                           f'<td>{points_label(row["total"])}</td></tr>')
+        details.append(f'<details><summary>{escape(operation)} · {rows[0]["cases"]} scheduled measurements per engine</summary>'
+                       '<table><thead><tr><th>Engine</th><th>Query variant</th><th>Verified</th><th>Timeouts</th>'
+                       '<th>Verified p99</th><th>Verified median</th><th>Peak RSS (coverage)</th>'
+                       '<th>Points</th></tr></thead>'
                        f'<tbody>{"".join(entries)}</tbody></table></details>')
+    common = score["common_operations"]
+    common_detail = f' ({escape(", ".join(common))})' if common else ""
 
     return f'''<section id="{anchor}"><h2>{heading}</h2>
-<p>{len(score['categories'])} scored operations · {score['max_points']} possible points per engine{evidence}</p>
-<div class="plot">{score_chart(score, labels)}</div>
-<div class="table"><table><thead><tr><th>Rank</th><th>Engine</th><th>Deployment</th><th>Total</th><th>Correct</th><th>{labels[1]}</th>
-<th>{labels[2]}</th></tr></thead><tbody>{''.join(standings)}</tbody></table></div>
+<p>{len(score['categories'])} scored operations · {score['max_points']} possible points per engine{evidence}{cpu_description(score)}</p>
+<div class="plot">{score_chart(score)}</div>
+<div class="table"><table><thead><tr><th>Rank</th><th>Engine</th><th>Deployment</th><th>Query packs</th><th>Total points</th>
+<th>Verified operations</th><th>Shared p99 geometric mean</th></tr></thead><tbody>{''.join(standings)}</tbody></table></div>
+<p>The geometric mean uses {len(common)} of {len(score['categories'])} scored operations with a verified p99 on every engine{common_detail}.</p>
 <details><summary>Points by operation</summary>{''.join(details)}</details></section>'''
 
 
 def render(score, *other_cohorts):
-    target_ms = score["threshold_ns"] // NS_PER_MS
-    labels = ("Correct", f"p99 under {target_ms} ms", f"p99 under {FAST_RESPONSE_MS} ms")
-    legends = "".join(f'<li><span style="background:{color}"></span>{label}</li>'
-                      for label, color in zip(labels, COLORS, strict=True))
+    zero_latency = latency_label(score["zero_latency_score_ns"])
+    full_latency = latency_label(score["full_latency_score_ns"])
     cohorts = [(f"cohort-{index}", result) for index, result in enumerate((score, *other_cohorts), 1)]
     navigation = ""
     if other_cohorts:
         links = "".join(f'<a href="#{anchor}">{escape(result["cohort"])}</a>' for anchor, result in cohorts)
         navigation = f'<nav aria-label="Benchmark platforms">{links}</nav>'
-    sections = "".join(render_cohort(result, labels, anchor) for anchor, result in cohorts)
+    sections = "".join(render_cohort(result, anchor) for anchor, result in cohorts)
     title = f'{escape(score["workload"])} runtime leaderboard'
     return f'''<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -176,17 +196,19 @@ main{max-width:1100px;margin:auto;padding:32px 20px}h1,h2{margin:0 0 .45rem}h1{f
 p{margin:0 0 1rem;color:#41574f}section{background:#fff;border:1px solid #d8e2df;border-radius:9px;padding:20px;margin:18px 0}
 .plot,.table{overflow:auto}svg{display:block;font:12px system-ui,sans-serif;fill:#182b27}.total{font-weight:750}
 table{border-collapse:collapse;width:100%;font-size:.9rem}th,td{padding:.45rem .55rem;text-align:left;border-bottom:1px solid #d8e2df}
-.legend{display:flex;flex-wrap:wrap;gap:8px 18px;list-style:none;padding:0}.legend span{display:inline-block;width:.8em;height:.8em;margin-right:.4em}
 nav{display:flex;flex-wrap:wrap;gap:8px 18px}nav a{color:#265991}
 details{margin:.5rem 0}summary{cursor:pointer;font-weight:650}
 </style>
 ''' + f'''<main><h1>{title}</h1>
 <p>{score['deadline_seconds']:g} s query deadline · {score['rss_limit_bytes'] / 1e9:g} GB RSS cap</p>
-{navigation}<ul class="legend">{legends}</ul>{sections}
+{navigation}{sections}
 <section><h2>Scoring rules</h2>
-<p>Each category is one query operation. All scheduled cases must pass verification to earn any points.
-A complete pass earns 1 point. Nearest-rank p99 strictly below {target_ms} ms earns 1 point, and p99 strictly below {FAST_RESPONSE_MS} ms earns 1 more.</p>
-<p>With five scheduled cases, the p99 is the slowest response. Operations omitted by every engine are outside the report.</p>
+<p>All scheduled measurements for an operation must pass verification to earn points.
+A verified nearest-rank p99 earns 0 points at {zero_latency} or slower and {score['max_points_per_operation']} points
+at {full_latency} or faster. Points increase logarithmically between those endpoints.
+Rank uses the sum of unrounded points across operations.</p>
+<p>Each operation shows its scheduled measurement count. Below 100 verified measurements, nearest-rank p99 is the maximum.
+Operations omitted by every engine are outside the report.</p>
 </section></main></html>
 '''
 
@@ -199,13 +221,9 @@ def main():
                         help="saved workload directory in a named ranking; repeat a name to combine runs within a platform")
     parser.add_argument("--exclude-engine", choices=ENGINES, action="append", default=[], help="repeat to omit engines")
     parser.add_argument("--reference", type=Path, help="expected rows for historical runs without a saved reference")
-    parser.add_argument("--latency-target-ms", type=int, default=DEFAULT_LATENCY_TARGET_MS,
-                        help="exclusive category p99 cutoff in milliseconds (default: %(default)s)")
     parser.add_argument("--out", type=Path, default=Path("results/leaderboard.html"), help="standalone HTML leaderboard")
     parser.add_argument("--json", type=Path, help="also export the scores and per-operation evidence as JSON")
     args = parser.parse_args()
-    if args.latency_target_ms <= 0:
-        parser.error("--latency-target-ms must be positive")
     if args.json and args.json.resolve() == args.out.resolve():
         parser.error("The HTML and JSON require different output files")
     try:
@@ -218,7 +236,7 @@ def main():
         scores = []
         for name, directories in groups.items():
             report, case_hash = load_cohort(directories, args.reference, args.exclude_engine)
-            score = score_workload(report, latency_target_ms=args.latency_target_ms)
+            score = score_workload(report)
             score["cases_sha256"] = case_hash
             if name:
                 score["cohort"] = name
@@ -238,7 +256,7 @@ def main():
         if "cohort" in score:
             print(score["cohort"])
         for row in score["standings"]:
-            print(f'{row["rank"]}. {NAMES[row["engine"]]} · {row["total"]}/{score["max_points"]}')
+            print(f'{row["rank"]}. {NAMES[row["engine"]]} · {points_label(row["total"])}/{score["max_points"]}')
     print(args.out)
 
 

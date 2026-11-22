@@ -10,7 +10,8 @@ from . import fetch
 from .bulk_import import LOAD_METHODS
 from .cases import write_case_file
 from .catalog import SOURCES
-from .run import engine_order, orchestrate, write_line
+from .resources import query_threads, worker_cpu_ids
+from .run import benchmark_packs, orchestrate, trial_plan, write_line
 from .servers import validate_server_platform
 from .supervision import QUERY_DEADLINE_POLICY, QUERY_RSS_POLICY, RSS_SAMPLE_INTERVAL
 
@@ -42,6 +43,8 @@ def make_plan(args):
         raise ValueError("write operations require --mixed")
 
     destination = args.out or Path("results/all" if args.all_workloads else "results/selected")
+    engines = args.engine
+    cpu_ids = worker_cpu_ids()
     jobs = []
     for name in workloads:
         suite, scale = WORKLOADS[name]
@@ -57,13 +60,16 @@ def make_plan(args):
             "dataset": str(dataset), "params": str(params),
             "updates": str(updates) if args.mixed else None, "out": str(destination / name),
             "reference": references.get(name),
+            "engine_packs": {engine: benchmark_packs(suite, engine, args.pack, use_defaults=not args.no_default_packs)
+                             for engine in engines},
         })
-    engines = engine_order(args.engine)
     return {
-        "out": str(destination), "engines": engines, "packs": args.pack,
+        "out": str(destination), "engines": engines, "trials": trial_plan(engines, args.trials), "packs": args.pack,
+        "default_packs": not args.no_default_packs, "cpu_ids": cpu_ids,
         "loaders": {engine: LOAD_METHODS[engine] for engine in engines},
         "per_read": args.per_read, "max_updates": args.max_updates, "mixed": args.mixed,
-        "skip_fetch": args.skip_fetch, "batch_size": args.batch_size, "threads": args.threads,
+        "sample_seed": args.sample_seed, "read_passes": args.read_passes, "warmup": args.warmup,
+        "skip_fetch": args.skip_fetch, "batch_size": args.batch_size, "threads": query_threads(args.threads, cpu_ids),
         "query_timeout": args.query_timeout, "worker_timeout": args.timeout,
         "query_deadline_policy": QUERY_DEADLINE_POLICY,
         "query_rss_policy": QUERY_RSS_POLICY,
@@ -97,10 +103,13 @@ def run_matrix(args, plan):
                         suite, dataset, Path(job["params"]), case_file,
                         per_read=args.per_read, updates=Path(job["updates"]) if job["updates"] else None,
                         max_updates=args.max_updates, operations=job["operations"],
+                        sample_seed=args.sample_seed, read_passes=args.read_passes, warmup=args.warmup,
                     )
                     result = orchestrate(Namespace(
                         suite=suite, scale=scale, dataset=dataset, cases=case_file, out=Path(job["out"]),
-                        engine=plan["engines"], pack=args.pack, batch_size=args.batch_size, threads=args.threads,
+                        engine=plan["engines"], trials=args.trials, pack=args.pack,
+                        no_default_packs=args.no_default_packs,
+                        batch_size=args.batch_size, threads=args.threads,
                         query_timeout=args.query_timeout, timeout=args.timeout,
                         rss_limit_bytes=plan["rss_limit_bytes"],
                         reference=Path(job["reference"]) if job["reference"] else None,

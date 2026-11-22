@@ -1,6 +1,6 @@
 # Graph DB Benchmark Suite
 
-Open-source benchmark suite for graph databases, with reproducible runs and correctness checks.
+An open-source performance benchmark for labeled property graph (LPG) databases that support or advertise support for openCypher.
 
 The Python runner replays the same published Cypher queries against embedded and server databases. It checks results against expected answers and records query latency, import time, and peak memory. The LDBC workload replays are unaudited. [LDBC fair use policy](https://ldbcouncil.org/benchmarks/fair-use-policies/)
 
@@ -8,11 +8,19 @@ The Python runner replays the same published Cypher queries against embedded and
 - **FinBench Transaction** runs at SF1 and SF10 with partial operation coverage. [FinBench](https://ldbcouncil.org/benchmarks/finbench/)
 - **Graphalytics** is planned. [Graphalytics](https://ldbcouncil.org/benchmarks/graphalytics/)
 
+## Affiliation and purpose
+
+We maintain this suite and develop Velr, one of the engines it tests. We built the suite for our own testing and made it public to share what we learn with the wider graph database community.
+
+We use the same Cypher reference queries developed and published by LDBC as the baseline for every engine. This reduces bias from choosing queries tailored to a particular engine. We check results against shared expected answers and document every engine-specific rewrite. We publish the full test suite and methodology so you can inspect the setup, rerun the tests, and verify the results yourself. Each result reflects the workloads, data scales, hardware, and engine configurations used in that run. [Query sources and deviations](#query-sources-and-deviations) · [Reproduce a run](#run-it)
+
 ## Run it
 
 Install `just`, CPython 3.12, and Docker with a Linux runtime. `just setup` builds the pinned benchmark image for the Docker host's CPU, choosing Linux ARM64 or Linux x86-64. The launcher checks the image, Python, and server executables against that architecture. Set `SHOOTOUT_DOCKER_CONTEXT` to choose a Docker context. On macOS, give the Docker VM enough RAM to enforce the 15 GB default RSS cap, for example 18 GiB.
 
-Each benchmark invocation runs all selected engines in one container. The image includes the pinned PyPI drivers and the published server and loader binaries required by the engines. The runner stages each dataset once on the container's Linux filesystem before timing any engine and creates a fresh store per engine. It saves results to the workspace and records the image ID, architecture, CPU count, and visible host memory in `run.json`.
+Each benchmark invocation runs all selected engines in one container. The image includes the pinned PyPI drivers and the published server and loader binaries required by the engines. The runner stages each dataset once on the container's Linux filesystem before timing any engine and creates a fresh store for each engine in each trial. It saves results to the workspace and records the image ID, architecture, CPU count, and visible host memory in `run.json`.
+
+The Docker runner sets Relate’s per-expression value limit to **512 MiB** with `RELATE_EXPRESSION_MEMORY_LIMIT=512mib` and records it in `run.json` when Relate is selected. The benchmark’s process-tree RSS cap still applies. [Relate limits](https://relatedb.ai/docs/reference/storage/limits-and-sizing/)
 
 Input and output paths under the repository are shared with the container. For paths outside the repository, set `SHOOTOUT_DOCKER_MOUNTS` to a colon-separated list of existing host directories.
 
@@ -25,7 +33,9 @@ just sf1-cohort results/snb-sf1-cohort
 
 The smoke run downloads the public fixtures, loads the same logical snapshot in each engine, and exercises a small set of canonical reads. It records query refusals, mismatches, and timeouts as benchmark outcomes. It uses smaller inputs and shorter time limits than the scale runs. Use a new output directory for each run, such as `just smoke results/smoke-repeat`.
 
-`just sf1-cohort` runs the ten engines in the SF1 comparison and verifies results against the checked-in expected answers. Give it a new output directory for each run. To turn the saved results into a leaderboard, run:
+`just sf1-cohort` runs eleven engines against checked-in expected answers for 50 distinct inputs per operation. The recipe samples inputs with seed 42, runs one warm-up query per operation, then shuffles the same inputs across ten measured passes. That gives 500 response measurements per operation and 10,500 per engine. The report excludes the warm-up cases, whose outcomes remain in the raw logs. The recipe allows up to 24 hours per engine by default. `just sf1-cohort-quick` runs the five-input schedule for quicker checks.
+
+Give each run a fresh output directory. To turn the saved results into a leaderboard, run this command.
 
 ```sh
 just leaderboard --run results/snb-sf1-cohort --out results/snb-sf1-leaderboard.html
@@ -38,7 +48,7 @@ just finbench 1 results/finbench-sf1
 just finbench 10 results/finbench-sf10
 ```
 
-Use `--engine` to choose an engine for a run. For a custom selection, `just selected` accepts repeated `--workload`, `--engine`, and `--op` flags. Use the published workload operation IDs, such as `IS1` or `TSR1`.
+Repeat `--engine` to select engines in the order you want to run them. The built-in cohorts use alphabetical engine order by default. For a custom selection, `just selected` accepts repeated `--workload`, `--engine`, and `--op` flags. Use the published workload operation IDs, such as `IS1` or `TSR1`.
 
 ```sh
 just selected --workload snb-sf1 --engine velr --op IS1 --per-read 1 --out results/velr-is1
@@ -58,7 +68,16 @@ just selected --workload snb-sf1 --engine graphqlite --engine neug \
     --reference snb-sf1=references/snb-sf1.json --out results/snb-candidates
 ```
 
-The runner executes one engine at a time. The plan and `run.json` record the execution order. The default RSS cap is **15 GB** (15 billion bytes) per worker and its subprocesses. Every replay query has the same **30-second** external wall-clock deadline through result consumption. Use `--rss-limit-gb` and `--query-timeout` to change the caps for every selected engine and workload. The `--timeout` option covers all work for one engine, including initial load and any restarts, and defaults to two hours.
+The runner executes one engine at a time. Use `--trials N` to repeat a run with the same case schedule. The first trial uses the selected order, and each later trial moves the first engine to the end. A full rotation gives every engine one turn in each position. `trials.json` lists the trial directories and their orders. Each trial records its order in `run.json` and writes engine outcomes in execution order to `summary.jsonl`. `just chart --run` accepts the parent directory. For a leaderboard, point `--run` at an individual trial directory.
+
+```sh
+just sf1-cohort-quick results/sf1-order --trials 2 --engine grafeo --engine velr
+just leaderboard --run results/sf1-order/trial-001 --out results/sf1-order-trial-001.html
+```
+
+On Linux, including the benchmark container, every worker and its subprocesses use the same set of **up to six logical cores**. The runner selects the first six available CPU IDs, or all available IDs on a smaller host, and records the mask in `run.json`. Kùzu-family engines and NeuG default to that many query threads. `--threads` can lower their internal thread limit. Native macOS runs report that CPU affinity is unavailable.
+
+The default RSS cap is **15 GB** (15 billion bytes) per worker and its subprocesses. Every replay query has the same **30-second** external wall-clock deadline through result consumption. Use `--rss-limit-gb` and `--query-timeout` to change the caps for every selected engine and workload. The `--timeout` option covers all work for one engine, including initial load and any restarts, and defaults to two hours.
 
 ```sh
 just all --rss-limit-gb 24 --query-timeout 90 --out results/full-matrix-24gb-90s
@@ -82,7 +101,9 @@ just selected --workload snb-sf1 --engine neo4j --engine falkordb \
     --reference snb-sf1=references/snb-sf1.json --out results/snb-sf1-servers
 ```
 
-Neo4j uses a 1 GiB initial heap, 4 GiB maximum heap, and 4 GiB page cache. Its offline importer uses a 1 GiB Java heap and up to 2 GiB of off-heap memory. TuGraph uses single-label vertices and stores the SNB string arrays as JSON strings. The runner uses the driver's REST transport with bound parameters and verifies the canonical queries against the same expected rows. [TuGraph schema and transport notes](deviations/README.md)
+For Neo4j, the runner applies the heap and page cache values recommended by `neo4j-admin server memory-recommendation`. It passes the smaller of the shared RSS cap and the memory capacity visible to the benchmark, including any Linux cgroup limit. At the default **15 GB** cap on a host with enough RAM, Neo4j Community 2026.10.2 recommends a **4,900 MiB initial and maximum heap** and a **5,600 MiB page cache** (`--memory=14305m`). The recommendation leaves headroom for native memory and other processes. Each `run.json` records the budget and settings. The offline importer uses a 1 GiB Java heap and up to 2 GiB of off-heap memory. [Neo4j Admin memory recommendations](https://neo4j.com/docs/operations-manual/current/configuration/neo4j-admin-memrec/) · [Neo4j memory configuration](https://neo4j.com/docs/operations-manual/current/performance/memory-configuration/)
+
+TuGraph uses single-label vertices and stores the SNB string arrays as JSON strings. The runner uses the driver's REST transport with bound parameters and verifies the canonical queries against the same expected rows. [TuGraph schema and transport notes](deviations/README.md)
 
 The same supervisor enforces each query deadline outside the database process, including for drivers that lack cancellation. After a timed-out read it kills the process group, records the timeout, and reopens the same persistent snapshot in a fresh worker to continue at the next case. A timed-out write stops replay for that engine because its commit outcome may be unknown. Resume events identify the connection changes so timing comparisons can use cases measured in matching conditions.
 
@@ -90,7 +111,7 @@ Each recipe downloads and caches the official datasets and parameters under `dat
 
 ## Workload coverage
 
-The read sweep takes five rows per published complex-read parameter file where available. For short reads, it samples IDs from the snapshot because these operations normally follow other operations in the official driver. FinBench short reads use a fixed time window and threshold. The case file preserves the exact parameters for every engine.
+The default read sweep takes the first five rows per published complex-read parameter file where available. For short reads, it takes IDs from the snapshot because these operations normally follow other operations in the official driver. FinBench short reads use a fixed time window and threshold. `--sample-seed` samples across each input source. `--per-read` sets the input count, `--read-passes` sets the number of measured passes, and `--warmup` adds one warm-up per operation. These flags are available on `just selected` and the `cases` command. The case file preserves the exact parameters and execution order for every engine.
 
 Add update cases with `just snb-mixed 1 results/snb-sf1-mixed` or `just finbench-mixed 1 results/finbench-sf1-mixed`. These recipes append up to 200 time-ordered writes from the published streams. To execute writes, add verified postconditions to the case file and replay it with `just run`. Each engine starts with a fresh snapshot. FinBench has draft templates for TW14, TW15, TW18, and TW19. The other writes and all three read-write operations are listed as omissions. [SNB Interactive v1](https://ldbcouncil.org/benchmarks/snb/interactive/), [FinBench specification](https://ldbcouncil.org/ldbc_finbench_docs/ldbc-finbench-specification.pdf)
 
@@ -100,10 +121,13 @@ Each run records `ldbc_op` for the published operation and `op` for the selected
 
 The [source catalog](queries/sources.json) pins the upstream revisions and hashes the query files byte for byte. SNB Interactive v1 uses LDBC's Neo4j/Cypher reference. FinBench uses the Neo4j Cypher draft in LDBC's reference implementations repository. The draft includes templates from an earlier workload revision. The catalog retains those templates for provenance and records which operations the published workload can replay. [SNB query source](https://github.com/ldbc/ldbc_snb_interactive_v1_impls/tree/11db98cc2ba14c33492f6c0c34e68c8be7e22e5f/cypher/queries), [FinBench query source](https://github.com/ldbc/ldbc_finbench_transaction_impls/tree/5dc5fb5d6a1fd6324c2dfcd555c5bb6985371a2c/neo4j)
 
-Use `just queries` to verify the canonical hashes and print provenance and omissions. To run a documented deviation, request the pack explicitly. Each case records the canonical and executed hashes.
+The runner explicitly applies the documented Kùzu-family rewrites to **Kùzu, Ladybug, and RyuGraph**. In SNB, eight of the 21 canonical read operations use the logical `Message` label. Without `snb-typed-message`, all three engines rejected those eight operations in a fixture probe because the loaded schema has separate `Post` and `Comment` tables. The rewrite uses a table union, and replay still checks each response against the same expected rows. In FinBench, the default `finbench-map-projection` pack expresses TSR1’s result as a literal map for these engines. [Rewrite details and validation status](deviations/README.md)
+
+Each case records the canonical and executed query hashes. The leaderboard and charts identify which packs were used. Use `--no-default-packs` to replay the canonical queries, `--pack` to request an additional documented deviation, and `just queries` to check upstream hashes and view provenance and omissions.
 
 ```sh
-just snb 1 results/snb-sf1-typed --pack snb-typed-message
+just sf1-cohort-quick results/snb-sf1-typed-canonical --no-default-packs \
+    --engine kuzu --engine ladybug --engine ryugraph
 just finbench 1 results/finbench-sf1-jaccard --pack finbench-cypher-jaccard
 ```
 
@@ -136,7 +160,7 @@ Each run has a `run.json` configuration, a copy of its case sequence, a JSONL su
 
 ## Verifying query results
 
-The runner compares the complete result with expected rows after timing the query. A wrong result fails and records the actual and expected rows. A case without an expected answer fails before execution. Included source-data checks cover SNB IS1 and IS4 and FinBench TSR1. The checked-in SF1 reference covers all 105 reads in the default schedule. Its answers were generated with the pinned LDBC Cypher on Neo4j 5.26.31, on the same initial snapshot used by the embedded engines. LDBC also publishes mixed-workload validation data generated with its Neo4j implementation. [SF1 reference answers](references/snb-sf1.json), [LDBC validation data](https://github.com/ldbc/ldbc_snb_interactive_v1_impls#validation-parameters)
+The runner compares the complete result with expected rows after timing the query. A wrong result fails and records the actual and expected rows. A case without an expected answer fails before execution. Included source-data checks cover SNB IS1 and IS4 and FinBench TSR1. The checked-in SF1 references cover the five-input and 50-input schedules. Their answers come from the pinned LDBC Cypher on Neo4j 5.26.31 using the same initial snapshot as the benchmark engines. The larger reference stores one answer per distinct input. Replay still verifies every attempt. LDBC also publishes mixed-workload validation data generated with its Neo4j implementation. [Five-input reference](references/snb-sf1.json), [50-input reference](references/snb-sf1-p99.json), [LDBC validation data](https://github.com/ldbc/ldbc_snb_interactive_v1_impls#validation-parameters)
 
 The runner preserves row multiplicity and ordering. For SNB it accepts arbitrary order inside the specified IC1 and IC12 collections and within equal sort-key groups in IC14 and IS7. The node sequence inside each IC14 path must still match. [SNB Interactive v1 specification](https://ldbcouncil.org/ldbc_snb_docs/workload-interactive-v1.pdf)
 
@@ -147,6 +171,15 @@ just run snb 1 data/snb/sf1 results/snb-sf1.cases.jsonl results/velr-repeat \
 ```
 
 For another SNB read schedule, load the matching starting snapshot on a separate Neo4j reference and run `just reference-snb --help`. The command checks node and relationship counts and ties its expected rows to the case-file and canonical-query hashes. The reference server is used during answer generation. Replay uses the saved answer file on the benchmark host.
+
+To regenerate the larger SF1 schedule and its expected answers, run these commands with the reference server listening on local port 7474.
+
+```sh
+just sf1-p99-cases results/snb-sf1-p99.cases.jsonl
+just reference-snb --scale 1 --cases results/snb-sf1-p99.cases.jsonl \
+    --archive data/downloads/social_network-sf1-CsvComposite-LongDateFormatter.tar.zst \
+    --nodes 3181724 --relationships 17256038 --out results/snb-sf1-p99-reference.json
+```
 
 For a custom case file, use one JSON object per line with `op` and `params`. Supply `expected` as an array of complete result rows and use `unordered: true` only when the query leaves the entire row order unspecified. Include `ldbc_op` when it differs from `op`. A write requires a `postcondition` object with a read-only `query`, its `params` if needed, and `expected` rows. The postcondition has its own external deadline and runs outside the timed write. A failed write or postcondition stops dependent cases. SF10 and FinBench require case-specific expected answers for reads beyond the built-in checks.
 
@@ -171,17 +204,16 @@ just leaderboard --run results/snb-sf1 --out results/snb-sf1-leaderboard.html \
     --json results/snb-sf1-scores.json
 ```
 
-The scorer awards up to three points per query operation. An engine must pass verification on every scheduled input before it can earn any points.
+An operation earns up to three points based on its nearest-rank p99. Every measured attempt must pass verification to earn points. The standings sum the unrounded operation scores and show how many operations each engine verified.
 
-| Criterion | Default points | Rule |
-| --- | ---: | --- |
-| Correct | 1 | Every case passes verification. |
-| p99 under 250 ms | 1 | Nearest-rank p99 over those cases is strictly below 250 ms by default. |
-| p99 under 25 ms | 1 | Nearest-rank p99 over those cases is strictly below 25 ms. |
+| Verified p99 | Points per operation |
+| --- | ---: |
+| 2.5 s or slower | 0 |
+| 15 ms or faster | 3 |
 
-With five cases per operation, nearest-rank p99 is the slowest case. The two latency points are cumulative. Operations omitted by every engine are outside the report. The operation charts include query RSS and import measurements.
+Between these endpoints, points follow `3 × log(2500 / p99_ms) / log(2500 / 15)`. Equal proportional improvements earn equal point gains. With 500 verified measurements per operation, nearest-rank p99 is the 495th value in ascending order. With fewer than 100 measurements it is the maximum. The operation details show scheduled measurements, verified responses, timeouts, p99, and median. The standings also show the geometric mean of p99 across the operations fully verified by every engine, along with the shared operation IDs and coverage. Operations omitted by every engine are outside the report. The operation charts include query RSS and import measurements.
 
-Repeat `--run` to combine engines from separate result directories. Each engine needs one source, and the runs must match on workload, scale, case schedule, expected answers, platform, Python version, and limits. Use `--exclude-engine` to leave an engine out of the cohort. Adjust the 250 ms scoring cutoff with `--latency-target-ms`. The JSON records the thresholds, each fully verified operation's p99, and the awarded points.
+Repeat `--run` to combine engines from separate result directories. Each engine needs one source, and the runs must match on workload, scale, case schedule, expected answers, platform, Python version, and limits. Use `--exclude-engine` to leave an engine out of the cohort. The JSON records the scoring endpoints, each fully verified operation's p99, the awarded points, and the operations used in the geometric mean.
 
 Use `--cohort NAME=DIR` to display multiple platform rankings on the same page. Repeat a name to supply several runs for that platform. Each cohort shares the workload, case schedule, expected answers, and caps. The JSON export contains a `cohorts` array with the standings and operation scores for each platform.
 

@@ -2,6 +2,7 @@
 
 from collections import Counter
 from contextlib import ExitStack
+from functools import partial
 from hashlib import sha256
 import json
 import os
@@ -18,15 +19,25 @@ from time import monotonic_ns, perf_counter_ns
 from .bulk_import import LOAD_METHODS, load_snapshot
 from .catalog import SOURCES, load, parameters
 from .datasets import first_person_id, id_indexes, verify_snapshot
-from .engines import Database, version
+from .engines import TYPED, Database, version
+from .resources import memory_capacity_bytes, query_threads, worker_cpu_ids
 from .server_import import import_falkordb, import_memgraph, import_tugraph
-from .servers import SERVER_VERSIONS, import_neo4j, validate_server_platform
+from .servers import SERVER_VERSIONS, import_neo4j, neo4j_memory_settings, validate_server_platform
 from .supervision import (
     BYTES_PER_GB, IMPORT_RSS_KEY, NS_PER_SECOND, QUERY_DEADLINE_POLICY, QUERY_RSS_POLICY, RSS_SAMPLE_INTERVAL,
     check_rss_monitor, import_window, query_window, supervise_worker,
 )
 from .velr_import import offline_import
 from .verification import answer_rows, encode, equal_rows, load_reference, rows_digest
+
+TYPED_DEFAULT_PACKS = {"snb": "snb-typed-message", "finbench": "finbench-map-projection"}
+
+
+def benchmark_packs(suite, engine, packs, *, use_defaults):
+    default = TYPED_DEFAULT_PACKS.get(suite)
+    if use_defaults and engine in TYPED and default and default not in packs:
+        return [default, *packs]
+    return list(packs)
 
 
 def rss_bytes(scope=resource.RUSAGE_SELF):
@@ -77,6 +88,8 @@ def describe_case(suite, queries, number, case):
     official, omission = disposition(suite, case)
     query = queries.get(case["op"])
     event = {"event": "case", "case": number, "ldbc_op": official, "params": case["params"]}
+    if case.get("warmup"):
+        event["warmup"] = True
     if query is not None:
         event.update(query.provenance())
     approved_pack = SOURCES[suite].get("replacements", {}).get(official)
@@ -143,15 +156,15 @@ def run_cases(db, suite, queries, listed, answers, events, channel, start_case):
         write_line(events, event)
 
 
-def prepare_snapshot(config, events, path, channel):
-    engine, threads = config["engine"], config["threads"]
+def prepare_snapshot(config, events, path, channel, open_database):
+    engine = config["engine"]
     offline = {"velr": offline_import, "neo4j": import_neo4j, "tugraph": import_tugraph}.get(engine)
     server_loader = {"falkordb": import_falkordb, "memgraph": import_memgraph}.get(engine)
     empty_path = path.parent / "empty" if offline else path
     importer = None
     with ExitStack() as importing:
         start = perf_counter_ns()
-        with Database(engine, empty_path, threads) as db:
+        with open_database(empty_path) as db:
             opened = perf_counter_ns()
             if db.execute("RETURN 1 AS n") != [[1]]:
                 raise ValueError("First query returned an unexpected result")
@@ -173,7 +186,7 @@ def prepare_snapshot(config, events, path, channel):
             start = perf_counter_ns()
             counts, importer = offline(config["suite"], Path(config["dataset"]), path)
             importer["child_peak_rss_bytes"] = rss_bytes(resource.RUSAGE_CHILDREN)
-            with Database(engine, path, threads) as db:
+            with open_database(path) as db:
                 id_indexes(db, sorted(label for kind, label in counts if kind == "node"))
         elapsed = perf_counter_ns() - start
     write_line(events, {"event": "load", "duration_ns": elapsed, "loader": LOAD_METHODS[engine],
@@ -183,9 +196,16 @@ def prepare_snapshot(config, events, path, channel):
 
 
 def worker(config):
+    cpu_ids = config["cpu_ids"]
+    if cpu_ids is not None:
+        os.sched_setaffinity(0, cpu_ids)
+        if sorted(os.sched_getaffinity(0)) != cpu_ids:
+            raise RuntimeError("Could not apply the benchmark CPU affinity")
     engine = config["engine"]
     suite = config["suite"]
-    queries = load(suite, engine, config["packs"])
+    queries = load(suite, engine, config["engine_packs"][engine])
+    settings = config["engine_settings"].get(engine, {})
+    open_database = partial(Database, engine, threads=config["threads"], neo4j_memory=settings.get("memory"))
     listed = dict(cases(Path(config["cases"])))
     answers = load_reference(Path(config["reference"]), suite, config["scale"], config["cases_sha256"], listed,
                              load(suite)) if config.get("reference") else {}
@@ -202,12 +222,13 @@ def worker(config):
             write_line(events, {"event": "worker", "engine": engine,
                                 "version": SERVER_VERSIONS.get(engine, driver_version), **deployment,
                                 "python": platform.python_version(), "platform": platform.platform(),
-                                "requested_threads": config["threads"], "baseline_peak_rss_bytes": rss_bytes(),
+                                "requested_threads": config["threads"], "cpu_ids": cpu_ids,
+                                "engine_settings": settings, "baseline_peak_rss_bytes": rss_bytes(),
                                 "workload": config["suite"], "scale": config["scale"]})
-            counts = prepare_snapshot(config, events, path, channel)
+            counts = prepare_snapshot(config, events, path, channel, open_database)
             person_id = first_person_id(config["suite"], Path(config["dataset"]))
         start = perf_counter_ns()
-        with Database(engine, path, config["threads"]) as db:
+        with open_database(path) as db:
             opened = perf_counter_ns()
             if start_case == 1:
                 first = db.execute("MATCH (n:Person {id: $id}) RETURN n.id AS id", {"id": person_id})
@@ -223,8 +244,14 @@ def worker(config):
         write_line(events, {"event": "complete", "peak_rss_bytes": rss_bytes()})
 
 
-def engine_order(engines):
-    return sorted(engines, key=lambda name: name != "velr")
+def trial_plan(engines, count):
+    engines = list(engines)
+    trials = []
+    for number in range(1, count + 1):
+        offset = (number - 1) % len(engines)
+        trials.append({"trial": number, "engines": engines[offset:] + engines[:offset],
+                       "directory": f"trial-{number:03d}" if count > 1 else "."})
+    return trials
 
 
 def observed_cases(events, status):
@@ -235,7 +262,8 @@ def observed_cases(events, status):
             if event["event"] == "case_start":
                 last_case = {"op": event["op"], "case": event["case"]}
             elif event["event"] == "case":
-                observed[event["status"]] += 1
+                outcome = event["status"]
+                observed[f"warmup_{outcome}" if event.get("warmup") else outcome] += 1
                 last_case = None
     return observed, last_case
 
@@ -291,7 +319,7 @@ def replay_engine(config, queries, listed, log, case_rss):
 
 def orchestrate(args):
     suite, case_path = args.suite, args.cases
-    engines = engine_order(args.engine)
+    engines = args.engine
     validate_server_platform(engines)
     baselines = load(suite)
     data = case_path.read_bytes()
@@ -307,19 +335,35 @@ def orchestrate(args):
         _, omission = disposition(suite, item)
         if item["op"] not in baselines and not omission:
             raise ValueError(f"Unknown template on line {i}: {item['op']}")
-    queries = {engine: load(suite, engine, args.pack) for engine in engines}
+        if "warmup" in item and (type(item["warmup"]) is not bool or (
+            item["warmup"] and (item["op"] not in baselines or baselines[item["op"]].kind != "read")
+        )):
+            raise ValueError(f"Warm-up must be marked on a read case on line {i}")
+    engine_packs = {engine: benchmark_packs(suite, engine, args.pack, use_defaults=not args.no_default_packs)
+                    for engine in engines}
+    queries = {engine: load(suite, engine, packs) for engine, packs in engine_packs.items()}
     reference = getattr(args, "reference", None)
     if reference:
         load_reference(reference, suite, args.scale, case_hash, listed, baselines)
+    reference_data = reference.read_bytes() if reference else None
     check_rss_monitor()
+    cpu_ids = worker_cpu_ids()
+    memory_capacity = memory_capacity_bytes()
+    engine_settings = {}
+    if "neo4j" in engines:
+        budget = min(args.rss_limit_bytes, memory_capacity)
+        engine_settings["neo4j"] = {"memory_budget_bytes": budget, "memory": neo4j_memory_settings(budget)}
+    expression_limit = os.environ.get("RELATE_EXPRESSION_MEMORY_LIMIT")
+    if "relate" in engines and expression_limit is not None:
+        engine_settings["relate"] = {"RELATE_EXPRESSION_MEMORY_LIMIT": expression_limit}
     out = args.out.resolve()
     out.mkdir(parents=True)
-    saved_cases = out / "cases.jsonl"
-    saved_cases.write_bytes(data)
     common = {
-        "suite": suite, "scale": args.scale, "cases": str(saved_cases),
+        "suite": suite, "scale": args.scale,
         "cases_sha256": case_hash, "dataset": str(args.dataset.resolve()),
-        "packs": args.pack, "batch_size": args.batch_size, "threads": args.threads,
+        "packs": args.pack, "default_packs": not args.no_default_packs, "engine_packs": engine_packs,
+        "batch_size": args.batch_size, "threads": query_threads(args.threads, cpu_ids), "cpu_ids": cpu_ids,
+        "memory_capacity_bytes": memory_capacity, "engine_settings": engine_settings,
         "case_count": len(listed), "worker_timeout_seconds": args.timeout, "query_timeout": args.query_timeout,
         "query_deadline_policy": QUERY_DEADLINE_POLICY,
         "query_rss_policy": QUERY_RSS_POLICY,
@@ -327,26 +371,52 @@ def orchestrate(args):
                             else "worker_process_tree" for engine in engines},
         "rss_limit_bytes": args.rss_limit_bytes, "rss_sample_interval_seconds": RSS_SAMPLE_INTERVAL,
     }
-    if reference:
-        saved_reference = out / "reference.json"
-        reference_data = reference.read_bytes()
-        saved_reference.write_bytes(reference_data)
-        common.update(reference=str(saved_reference), reference_sha256=sha256(reference_data).hexdigest())
+    if warmup_count := sum(item.get("warmup", False) for item in listed.values()):
+        common["warmup_count"] = warmup_count
+    if reference_data is not None:
+        common["reference_sha256"] = sha256(reference_data).hexdigest()
     if image := os.environ.get("SHOOTOUT_CONTAINER_IMAGE"):
         common["container"] = {
             "image": image,
             "platform": os.environ["SHOOTOUT_CONTAINER_PLATFORM"],
             "cpus": len(os.sched_getaffinity(0)),
-            "memory_bytes": os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"),
+            "memory_bytes": memory_capacity,
         }
+    trials = trial_plan(engines, args.trials)
+    if len(trials) > 1:
+        (out / "trials.json").write_text(json.dumps({"trials": trials}, indent=2) + "\n", encoding="utf-8")
+
+    failures = 0
+    with ExitStack() as stack:
+        workspace = None
+        dataset = common["dataset"]
+        if image:
+            workspace = stack.enter_context(TemporaryDirectory(prefix="shootout-"))
+            dataset = str(shutil.copytree(dataset, Path(workspace) / "dataset"))
+        for trial in trials:
+            trial_out = out / trial["directory"]
+            settings = common.copy()
+            if len(trials) > 1:
+                trial_out.mkdir()
+                settings["trial"] = trial["trial"]
+                print(f"Trial {trial['trial']}/{len(trials)}: {', '.join(trial['engines'])}", flush=True)
+            failures |= run_trial(trial["engines"], settings, queries, listed, data, reference_data,
+                                  trial_out, workspace, dataset)
+    return failures
+
+
+def run_trial(engines, common, queries, listed, case_data, reference_data, out, workspace, dataset):
+    saved_cases = out / "cases.jsonl"
+    saved_cases.write_bytes(case_data)
+    common["cases"] = str(saved_cases)
+    if reference_data is not None:
+        saved_reference = out / "reference.json"
+        saved_reference.write_bytes(reference_data)
+        common["reference"] = str(saved_reference)
     settings = {**common, "engines": engines, "loaders": {engine: LOAD_METHODS[engine] for engine in engines}}
     (out / "run.json").write_text(json.dumps(settings, indent=2) + "\n")
 
-    if image:
-        with TemporaryDirectory(prefix="shootout-") as workspace:
-            dataset = shutil.copytree(common["dataset"], Path(workspace) / "dataset")
-            return run_engines(engines, {**common, "dataset": str(dataset)}, queries, listed, out, workspace)
-    return run_engines(engines, common, queries, listed, out, out)
+    return run_engines(engines, {**common, "dataset": dataset}, queries, listed, out, workspace or out)
 
 
 def run_engines(engines, common, queries, listed, out, workspace):

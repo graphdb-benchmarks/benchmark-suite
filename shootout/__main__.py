@@ -45,6 +45,7 @@ def make_cases(args):
     write_case_file(
         args.suite, args.dataset, args.params, args.out, per_read=args.per_read,
         updates=args.updates, max_updates=args.max_updates, operations=args.op,
+        sample_seed=args.sample_seed, read_passes=args.read_passes, warmup=args.warmup,
     )
     print(args.out)
 
@@ -54,21 +55,27 @@ def add_case_options(parser):
                         help="maximum number of source update events before filtering")
     parser.add_argument("--op", action="append", help="keep only the named workload operation; repeatable")
     parser.add_argument("--per-read", type=positive, default=5, help="parameters per read operation")
+    parser.add_argument("--sample-seed", type=int, help="sample inputs across their sources with this seed")
+    parser.add_argument("--read-passes", type=positive, default=1, help="number of measured passes over the read inputs")
+    parser.add_argument("--warmup", action="store_true", help="run one unscored input per read operation before measurement")
 
 
 def add_run_options(parser):
-    parser.add_argument("--engine", choices=ENGINES, action="append", help="repeat to select engines, including opt-in candidates")
+    parser.add_argument("--engine", choices=ENGINES, action="append", help="select engines in execution order; repeatable")
+    parser.add_argument("--trials", type=positive, default=1, help="repeat the run, rotating engine order each trial (default: 1)")
     parser.add_argument("--pack", action="append", default=[], help="opt in to a deviation pack; repeatable")
+    parser.add_argument("--no-default-packs", action="store_true", help="disable automatic Kùzu-family schema adaptations")
     parser.add_argument("--batch-size", type=positive, default=5000)
-    parser.add_argument("--threads", type=positive, default=1, help="query thread limit for typed engines")
+    parser.add_argument("--threads", type=positive, help="lower the Kùzu-family and NeuG query thread limit within the shared CPU budget")
     parser.add_argument("--query-timeout", type=positive, default=30, help="external deadline in seconds for each query (default: 30)")
     parser.add_argument("--timeout", type=positive, default=7200, help="wall-clock limit in seconds per engine, including restarts")
     parser.add_argument("--rss-limit-gb", dest="rss_limit_bytes", type=rss_limit, default=DEFAULT_RSS_LIMIT_BYTES,
                         metavar="GB", help="combined worker and child RSS limit in decimal GB (default: 15)")
 
 
-def select_engines(args, parser):
-    args.engine = args.engine or list(DEFAULT_ENGINES)
+def select_engines(args, parser, default_engines):
+    if args.engine is None:
+        args.engine = list(default_engines)
     if len(set(args.engine)) != len(args.engine):
         parser.error("remove duplicate --engine options")
 
@@ -83,7 +90,7 @@ def catalog(args):
             write_line(sys.stdout, {"suite": suite, "template": op, "status": "draft_only", "reason": reason})
 
 
-def main():
+def main(argv=None, *, default_engines=DEFAULT_ENGINES):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -146,7 +153,7 @@ def main():
     add_run_options(run)
 
     def invoke(args):
-        select_engines(args, run)
+        select_engines(args, run, default_engines)
         if args.scale == "fixture" and args.suite != "snb" or args.scale == "0.01" and args.suite != "finbench":
             run.error("use the scale label for this workload")
         try:
@@ -171,7 +178,7 @@ def main():
     add_run_options(matrix)
 
     def invoke_matrix(args):
-        select_engines(args, matrix)
+        select_engines(args, matrix, default_engines)
         try:
             plan = make_plan(args)
             if args.dry_run:
@@ -187,7 +194,7 @@ def main():
     child.add_argument("job")
     child.set_defaults(action=lambda args: worker(json.loads(args.job)))
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     return args.action(args)
 
 

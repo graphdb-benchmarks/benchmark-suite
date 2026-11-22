@@ -25,7 +25,8 @@ SHORT_NAMES = {"velr": "VE", "relate": "RE", "ladybug": "LA", "kuzu": "KU", "gra
                "arcadedb": "AR", "graphdblite": "GL", "ryugraph": "RY", "graphqlite": "GQ", "neug": "NG",
                "neo4j": "N4", "falkordb": "FK", "memgraph": "MG", "tugraph": "TU"}
 COMMON_SETTINGS = ("suite", "scale", "cases_sha256", "container", "query_timeout", "query_deadline_policy", "rss_limit_bytes",
-                   "rss_sample_interval_seconds", "query_rss_policy", "worker_timeout_seconds", "threads", "batch_size", "packs")
+                   "rss_sample_interval_seconds", "query_rss_policy", "worker_timeout_seconds", "threads", "batch_size",
+                   "cpu_ids", "memory_capacity_bytes", "packs", "default_packs")
 FAILURES = {
     "error": "Query error", "mismatch": "Wrong result", "verification_error": "Missing verification evidence",
     "skipped_after_write_failure": "Skipped after a failed write", "missing": "Case did not finish",
@@ -119,7 +120,7 @@ def engine_results(engine, directory, settings, listed, reference, queries):
             if number in observations or number not in listed:
                 raise ValueError(f"{event_file}: duplicate or unexpected case {number}")
             expected, query = describe_case(settings["suite"], queries, number, listed[number])
-            for field in ("ldbc_op", "params", "canonical_sha256", "executed_sha256"):
+            for field in ("ldbc_op", "params", "canonical_sha256", "executed_sha256", "warmup"):
                 if event.get(field) != expected.get(field):
                     raise ValueError(f"{event_file}: case {number} has different {field}")
             observations[number] = event
@@ -128,17 +129,24 @@ def engine_results(engine, directory, settings, listed, reference, queries):
     rows = {}
     cap_ns = settings["query_timeout"] * 1_000_000_000
     for number, item in listed.items():
+        if item.get("warmup"):
+            continue
         planned, _ = describe_case(settings["suite"], queries, number, item)
         event = observations.get(number, planned if planned.get("status") == "omitted" else {})
         expected = reference.get(number, item.get("expected"))
         verdict, duration, reason = outcome(event, item, expected, cap_ns, worker_status)
+        deviation = planned.get("deviation") if event.get("executed_sha256") and verdict != "omitted" else None
         rows[number] = {"outcome": verdict, "duration_ns": duration, "reason": reason,
-                        "peak_query_rss_bytes": case_rss.get(str(number))}
+                        "peak_query_rss_bytes": case_rss.get(str(number)),
+                        "query_pack": deviation["pack"] if deviation else None,
+                        "executed_sha256": event.get("executed_sha256") if verdict != "omitted" else None}
     return {"name": engine, "version": worker.get("version"), "platform": worker.get("platform"),
             "deployment": worker.get("deployment", "embedded"), "driver_version": worker.get("driver_version"),
             "query_rss_scope": worker.get("query_rss_scope", "worker_process_tree"),
             "python": worker.get("python"), "worker_status": worker_status,
             "directory": f"{directory.parent.name}/{directory.name}", "cases": rows,
+            "query_packs": sorted({row["query_pack"] for row in rows.values() if row["query_pack"]}),
+            "engine_settings": settings.get("engine_settings", {}).get(engine, {}),
             "import": {"loader": imported.get("loader", settings.get("loaders", {}).get(engine)),
                        "duration_ns": imported.get("duration_ns"),
                        "peak_rss_bytes": summary.get("import_peak_sampled_tree_rss_bytes"),
@@ -153,6 +161,8 @@ def read_workload(directory, overrides, reference_path, excluded=()):
     source = None
     operations = defaultdict(list)
     for number, item in listed.items():
+        if item.get("warmup"):
+            continue
         operation, _ = disposition(suite, item)
         operations[operation].append({"number": number, "params": item["params"]})
     engines = []
@@ -171,14 +181,20 @@ def read_workload(directory, overrides, reference_path, excluded=()):
         if engines and source != provenance:
             raise ValueError("Compared engines must use the same expected answers")
         source = provenance
-        engines.append(engine_results(name, root, run, listed, answers, load(suite, name, run["packs"])))
+        packs = run.get("engine_packs", {}).get(name, run["packs"])
+        engines.append(engine_results(name, root, run, listed, answers, load(suite, name, packs)))
     hosts = {(engine["platform"], engine["python"]) for engine in engines if engine["platform"] is not None}
     if len(hosts) > 1:
         raise ValueError("Compared engines must use the same host platform and Python version")
     aggregates = {op: [aggregate(engine, inputs) for engine in engines] for op, inputs in operations.items()}
-    return {"workload": workload_name(settings), "suite": suite, "scale": settings["scale"],
-            "deadline_seconds": settings["query_timeout"], "rss_limit_bytes": settings["rss_limit_bytes"],
-            "reference": source, "operations": dict(operations), "engines": engines, "aggregates": aggregates}
+    report = {"workload": workload_name(settings), "suite": suite, "scale": settings["scale"],
+              "deadline_seconds": settings["query_timeout"], "rss_limit_bytes": settings["rss_limit_bytes"],
+              "reference": source, "operations": dict(operations), "engines": engines, "aggregates": aggregates}
+    if "trial" in settings:
+        report["trial"] = settings["trial"]
+    if "cpu_ids" in settings:
+        report["cpu_ids"] = settings["cpu_ids"]
+    return report
 
 
 def aggregate(engine, inputs):
@@ -188,6 +204,7 @@ def aggregate(engine, inputs):
     memory = [row["peak_query_rss_bytes"] for row in results if row.get("peak_query_rss_bytes") is not None]
     return {"engine": engine["name"], "cases": len(results),
             "outcomes": {outcome: counts[outcome] for outcome in ("pass", "fail", "timeout", "omitted")},
+            "query_packs": sorted({row["query_pack"] for row in results if row.get("query_pack")}),
             "median_verified_ns": median(verified) if verified else None,
             "peak_query_rss_bytes": max(memory, default=None), "rss_cases": len(memory)}
 
@@ -361,6 +378,7 @@ def operation_chart(operation, inputs, engines, deadline, anchor):
             label = {"pass": "PASS", "timeout": "TIMEOUT", "fail": "FAIL", "omitted": "OMIT"}[verdict]
             name = NAMES[engine["name"]]
             reason = escape(result["reason"])
+            variant = escape(result.get("query_pack") or ("Canonical" if result.get("executed_sha256") else "—"))
             elapsed = latency_label(duration) if duration is not None else "—"
             rss = result.get("peak_query_rss_bytes")
             peak = rss_label(rss) if rss is not None else "—"
@@ -379,15 +397,23 @@ def operation_chart(operation, inputs, engines, deadline, anchor):
                              f'<text class="marker" x="{x:.1f}" y="{baseline + 13}" text-anchor="middle">{label}</text>')
             chart.append('</g>')
             details.append(f'<tr><td>{number}</td><td>{name}</td><td class="{verdict}">{label}</td>'
-                           f'<td title="{duration or 0} ns">{elapsed}</td><td>{peak}</td><td>{reason}</td></tr>')
+                           f'<td title="{duration or 0} ns">{elapsed}</td><td>{peak}</td><td>{variant}</td><td>{reason}</td></tr>')
     chart.append('</svg>')
     counts_text = ' · '.join(f'{counts[key]} {label}' for key, label in (
         ("pass", "passed"), ("fail", "failed"), ("timeout", "timed out"), ("omitted", "omitted"),
     ))
     return (f'<section id="{anchor}"><h3>{escape(operation)}</h3><p>{counts_text}</p><div class="plot">{"".join(chart)}</div>'
             f'<details><summary>Case details and inputs</summary><table><thead><tr><th>Case</th><th>Engine</th>'
-            f'<th>Outcome</th><th>Recorded time</th><th>Peak RSS</th><th>Evidence</th></tr></thead><tbody>{"".join(details)}</tbody></table>'
+            f'<th>Outcome</th><th>Recorded time</th><th>Peak RSS</th><th>Query variant</th><th>Evidence</th></tr></thead>'
+            f'<tbody>{"".join(details)}</tbody></table>'
             f'<pre>{escape(json.dumps(inputs, indent=2, sort_keys=True))}</pre></details></section>')
+
+
+def cpu_description(report):
+    if "cpu_ids" not in report:
+        return ""
+    ids = report["cpu_ids"]
+    return f" · {len(ids)} logical CPUs" if ids is not None else " · CPU affinity unavailable"
 
 
 def render(reports, missing=(), *, companion, appendix=False):
@@ -396,7 +422,9 @@ def render(reports, missing=(), *, companion, appendix=False):
         engines = report["engines"]
         deadline = report["deadline_seconds"]
         workload = escape(report["workload"])
-        headings = "".join(f'<th>{key}</th>' for key in ("Engine", "Deployment", "Passed", "Failed", "Timed out", "Omitted"))
+        if "trial" in report:
+            workload += f' · Trial {escape(str(report["trial"]))}'
+        headings = "".join(f'<th>{key}</th>' for key in ("Engine", "Deployment", "Query packs", "Passed", "Failed", "Timed out", "Omitted"))
         if appendix:
             headings += "<th>Run</th>"
         rows, legend = [], []
@@ -404,8 +432,9 @@ def render(reports, missing=(), *, companion, appendix=False):
             name = f'{NAMES[engine["name"]]} {engine["version"] or ""}'.strip()
             counts = Counter(case["outcome"] for case in engine["cases"].values())
             totals = "".join(f"<td>{counts[key]}</td>" for key in ("pass", "fail", "timeout", "omitted"))
+            packs = escape(", ".join(engine.get("query_packs", ())) or "Canonical")
             run_cell = f'<td>{escape(engine["directory"])}</td>' if appendix else ""
-            rows.append(f'<tr><td>{escape(name)}</td><td>{escape(engine["deployment"])}</td>{totals}{run_cell}</tr>')
+            rows.append(f'<tr><td>{escape(name)}</td><td>{escape(engine["deployment"])}</td><td>{packs}</td>{totals}{run_cell}</tr>')
             legend.append(f'<li><i style="background:{COLORS[position]}"></i>{escape(name)} ({SHORT_NAMES[engine["name"]]})</li>')
         if report["reference"]:
             source = report["reference"]["source"]
@@ -423,7 +452,7 @@ def render(reports, missing=(), *, companion, appendix=False):
                       for anchor, op, _ in panels)
             imports = import_panel(engines, report["rss_limit_bytes"])
         blocks.append(f'<article><h2>{workload}</h2><p>{deadline:g} s query deadline · '
-                      f'{report["rss_limit_bytes"] / 1e9:g} GB RSS cap. {escape(evidence)}</p>'
+                      f'{report["rss_limit_bytes"] / 1e9:g} GB RSS cap{cpu_description(report)}. {escape(evidence)}</p>'
                       f'<table><thead><tr>{headings}</tr></thead><tbody>{"".join(rows)}</tbody></table>'
                       f'<ul class="legend">{"".join(legend)}</ul>{imports}<nav aria-label="Queries">{links}</nav>'
                       f'{"".join(charts)}</article>')
@@ -468,7 +497,7 @@ h3 small{font-size:.68em;font-weight:500;color:#41574d;margin-left:8px}.unavaila
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run", required=True, action="append", type=Path, help="saved run or matrix directory; repeatable")
+    parser.add_argument("--run", required=True, action="append", type=Path, help="saved run, trials, or matrix directory; repeatable")
     parser.add_argument("--engine-from", action="append", default=[], metavar="ENGINE=DIR",
                         help="add or override one engine's source in a single workload comparison")
     parser.add_argument("--exclude-engine", choices=ENGINES, action="append", default=[],
@@ -482,20 +511,26 @@ def main():
         directories, missing = [], []
         for root in args.run:
             matrix = root / "matrix.json"
-            if (root / "run.json").is_file():
-                directories.append(root)
+            if (root / "run.json").is_file() or (root / "trials.json").is_file():
+                workloads = [(root.name, root, {})]
             elif matrix.is_file():
                 summary = root / "matrix-summary.jsonl"
                 statuses = {row["workload"]: row for _, row in cases(summary, allow_interrupted_line=True)} if summary.is_file() else {}
-                for job in read_json(matrix)["jobs"]:
-                    name = job["workload"]
-                    directory = root / name
-                    if (directory / "run.json").is_file():
-                        directories.append(directory)
-                    else:
-                        missing.append((name, statuses.get(name, {}).get("message", "Replay setup did not finish")))
+                names = [job["workload"] for job in read_json(matrix)["jobs"]]
+                workloads = [(name, root / name, statuses.get(name, {})) for name in names]
             else:
-                raise ValueError(f"{root}: no saved run or matrix")
+                raise ValueError(f"{root}: no saved run, trials, or matrix")
+            for name, directory, status in workloads:
+                manifest = directory / "trials.json"
+                runs = [(name, directory)]
+                if manifest.is_file():
+                    runs = [(f"{name} · Trial {trial['trial']}", directory / trial["directory"])
+                            for trial in read_json(manifest)["trials"]]
+                for label, run in runs:
+                    if (run / "run.json").is_file():
+                        directories.append(run)
+                    else:
+                        missing.append((label, status.get("message", "Replay setup did not finish")))
         overrides = {}
         for option in args.engine_from:
             name, _, path = option.partition("=")

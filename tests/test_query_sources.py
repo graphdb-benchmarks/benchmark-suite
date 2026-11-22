@@ -7,7 +7,7 @@ import unittest
 from shootout.catalog import load
 from shootout.datasets import create_schema
 from shootout.engines import Database, DEFAULT_ENGINES
-from shootout.run import bind, disposition
+from shootout.run import benchmark_packs, bind, disposition
 
 
 class QuerySources(unittest.TestCase):
@@ -27,6 +27,15 @@ class QuerySources(unittest.TestCase):
         self.assertEqual(upstream.text, other.text)
         self.assertEqual(upstream.upstream_sha256, typed.upstream_sha256)
         self.assertEqual(upstream.text.replace(":Message", ":Post:Comment"), typed.text)
+
+    def test_default_replays_use_the_typed_packs_only_on_kuzu_family(self):
+        for engine in ("kuzu", "ladybug", "ryugraph"):
+            self.assertEqual(benchmark_packs("snb", engine, [], use_defaults=True), ["snb-typed-message"])
+            self.assertEqual(benchmark_packs("finbench", engine, [], use_defaults=True), ["finbench-map-projection"])
+            self.assertEqual(benchmark_packs("snb", engine, [], use_defaults=False), [])
+        self.assertEqual(benchmark_packs("snb", "kuzu", ["snb-typed-message"], use_defaults=True), ["snb-typed-message"])
+        self.assertEqual(benchmark_packs("snb", "neug", [], use_defaults=True), [])
+        self.assertEqual(benchmark_packs("finbench", "graphdblite", [], use_defaults=True), [])
 
     def test_jaccard_on_published_drivers(self):
         for engine in DEFAULT_ENGINES:

@@ -6,7 +6,7 @@ import sys
 from tempfile import TemporaryDirectory
 import unittest
 
-from shootout.run import cases, engine_order
+from shootout.run import cases
 from shootout.supervision import supervise_worker
 
 
@@ -38,10 +38,6 @@ with socket.socket(fileno=int(sys.argv[1])) as channel:
         self.assertEqual((status, returncode), ("complete", 0))
         self.assertEqual(set(peaks), {0, 1})
         self.assertTrue(all(peak > 0 for peak in peaks.values()))
-
-    def test_velr_first_preserves_the_selection(self):
-        self.assertEqual(engine_order(["kuzu", "velr", "relate"]), ["velr", "kuzu", "relate"])
-        self.assertEqual(engine_order(["relate"]), ["relate"])
 
     def test_rss_limit_includes_the_child_process(self):
         allocate = "buffer = bytearray(56_000_000); buffer[::4096] = b'x' * len(buffer[::4096])"

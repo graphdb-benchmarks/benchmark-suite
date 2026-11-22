@@ -3,10 +3,10 @@ import unittest
 from shootout.leaderboard import render, score_workload
 
 
-def measurement(engine, *, passed=5, failed=0, omitted=0, latency=15, peak=20, samples=5):
-    return {"engine": engine, "cases": 5, "median_verified_ns": latency,
+def measurement(engine, *, passed=5, failed=0, omitted=0, latency=15, peak=20, samples=5, cases=5):
+    return {"engine": engine, "cases": cases, "median_verified_ns": latency,
             "rss_cases": samples, "peak_query_rss_bytes": peak,
-            "outcomes": {"pass": passed, "fail": failed, "timeout": 5 - passed - failed - omitted, "omitted": omitted}}
+            "outcomes": {"pass": passed, "fail": failed, "timeout": cases - passed - failed - omitted, "omitted": omitted}}
 
 
 def workload(operations):
@@ -32,17 +32,15 @@ class Leaderboard(unittest.TestCase):
     def test_wrong_and_timed_out_cases_earn_zero(self):
         report = workload({"IC1": [
             measurement("velr", latency=80, peak=70),
-            measurement("grafeo", latency=250_000_000, peak=250_000_000),
-            measurement("graphqlite", passed=3, failed=1, latency=2, peak=1),
+            measurement("grafeo", latency=2_500_000_000),
+            measurement("graphqlite", passed=4, failed=1, latency=2),
+            measurement("relate", passed=4, latency=2),
         ]})
-        points = {row["engine"]: row["points"] for row in score_workload(report)["standings"]}
-        self.assertEqual(points["velr"], {"correct": 1, "under_latency_target": 1, "p99_under_25_ms": 1})
-        self.assertEqual(points["grafeo"], {"correct": 1, "under_latency_target": 0, "p99_under_25_ms": 0})
-        self.assertEqual(sum(points["graphqlite"].values()), 0)
-        alternate = score_workload(report, latency_target_ms=500)
-        grafeo = next(row for row in alternate["standings"] if row["engine"] == "grafeo")
-        self.assertEqual(grafeo["points"]["under_latency_target"], 1)
-        self.assertIn("p99 under 500 ms", render(alternate))
+        result = score_workload(report)
+        standings = {row["engine"]: (row["total"], row["verified_operations"]) for row in result["standings"]}
+        self.assertEqual(standings, {"velr": (3, 1), "grafeo": (0, 1), "graphqlite": (0, 0), "relate": (0, 0)})
+        p99s = {row["engine"]: row["p99_ns"] for row in result["categories"]["IC1"]}
+        self.assertEqual(p99s, {"velr": 80, "grafeo": 2_500_000_000, "graphqlite": None, "relate": None})
 
     def test_rss_measurements_do_not_affect_the_score(self):
         report = workload({
@@ -53,21 +51,59 @@ class Leaderboard(unittest.TestCase):
         self.assertEqual(scores["IC10"][0]["total"], 3)
         self.assertEqual([row["total"] for row in scores["IC11"]], [3, 3])
 
-    def test_p99_under_25_ms_counts_only_fully_correct_categories(self):
-        report = workload({
-            "IC1": [measurement("velr", latency=24_999_999)],
-            "IC2": [measurement("velr", latency=24_999_999)],
-            "IC3": [measurement("velr", passed=4, failed=1, latency=24_999_999)],
-        })
-        report["engines"][0]["cases"][6]["duration_ns"] = 25_000_000
+    def test_small_sample_uses_maximum_as_p99(self):
+        report = workload({"IC1": [measurement("velr", latency=15_000_000)]})
+        report["engines"][0]["cases"][2]["duration_ns"] = 2_500_000_000
         result = score_workload(report)
-        self.assertEqual(result["standings"][0]["points"]["p99_under_25_ms"], 1)
-        self.assertEqual(result["categories"]["IC1"][0]["p99_ns"], 24_999_999)
-        self.assertEqual(result["categories"]["IC2"][0]["p99_ns"], 25_000_000)
-        self.assertEqual(result["categories"]["IC2"][0]["points"]["p99_under_25_ms"], 0)
-        self.assertIsNone(result["categories"]["IC3"][0]["p99_ns"])
-        self.assertEqual(result["categories"]["IC3"][0]["total"], 0)
-        self.assertIn("9 possible points", render(result))
+        self.assertEqual(result["categories"]["IC1"][0]["p99_ns"], 2_500_000_000)
+        self.assertEqual(result["standings"][0]["total"], 0)
+
+    def test_expanded_sample_uses_nearest_rank_p99(self):
+        report = workload({"IC1": [measurement("velr", passed=500, cases=500, latency=15_000_000)]})
+        for number in range(496, 501):
+            report["engines"][0]["cases"][number]["duration_ns"] = 1_000_000_000
+        result = score_workload(report)
+        score, = result["categories"]["IC1"]
+        self.assertEqual(score["p99_ns"], 15_000_000)
+        self.assertEqual(score["total"], 3)
+        self.assertIn("500 scheduled measurements", render(result))
+
+    def test_latency_points_are_logarithmic_between_the_anchors(self):
+        latencies_ns = [0, 15_000_000, 30_000_000, 60_000_000, 193_649_167, 2_500_000_000, 3_000_000_000]
+        report = workload({f"IC{index}": [measurement("velr", latency=latency)]
+                           for index, latency in enumerate(latencies_ns, 1)})
+        result = score_workload(report)
+        scores = [rows[0]["total"] for rows in result["categories"].values()]
+        self.assertEqual(scores[:2] + scores[-2:], [3, 3, 0, 0])
+        self.assertGreater(scores[2], scores[3])
+        self.assertAlmostEqual(scores[1] - scores[2], scores[2] - scores[3])
+        self.assertAlmostEqual(scores[4], 1.5)
+        document = render(result)
+        self.assertIn("0 points at 2.5 s", document)
+        self.assertIn("at 15 ms or faster", document)
+
+    def test_equal_latency_products_share_a_rank(self):
+        report = workload({
+            "IC1": [measurement("velr", latency=100_000_000), measurement("grafeo", latency=200_000_000),
+                    measurement("graphqlite", latency=100_000_000)],
+            "IC2": [measurement("velr", latency=400_000_000), measurement("grafeo", latency=200_000_000),
+                    measurement("graphqlite", latency=400_000_001)],
+        })
+        standings = score_workload(report)["standings"]
+        self.assertEqual([(row["engine"], row["rank"]) for row in standings], [("grafeo", 1), ("velr", 1), ("graphqlite", 3)])
+        self.assertAlmostEqual(standings[0]["total"], standings[1]["total"])
+        self.assertGreater(standings[1]["total"], standings[2]["total"])
+
+    def test_geometric_mean_shares_only_verified_operations(self):
+        report = workload({
+            "IC1": [measurement("velr", latency=100), measurement("grafeo", latency=900)],
+            "IC2": [measurement("velr", latency=900), measurement("grafeo", latency=100)],
+            "IC3": [measurement("velr", latency=10), measurement("grafeo", passed=4, failed=1)],
+        })
+        result = score_workload(report)
+        self.assertEqual(result["common_operations"], ["IC1", "IC2"])
+        self.assertEqual([row["common_geomean_p99_ns"] for row in result["standings"]], [300, 300])
+        self.assertIn("2 of 3 scored operations", render(result))
 
     def test_equal_scores_share_rank_and_universal_omissions_are_excluded(self):
         report = workload({

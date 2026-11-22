@@ -1,12 +1,12 @@
 # Query deviations and omissions
 
-Engine adapters handle connection setup, parameter binding, result handling, and loading. A workload statement comes directly from the hashed canonical file or from an explicitly selected pack in this directory.
+Engine adapters handle connection setup, parameter binding, result handling, and loading. A workload statement comes directly from the hashed canonical file or a pack in this directory. Replay enables the table and map adaptations below by default for Kùzu, Ladybug, and RyuGraph. Use `--no-default-packs` to disable automatic selection.
 
 | Pack | Scope | Change |
 | --- | --- | --- |
-| [snb-typed-message](snb-typed-message/pack.json) | Ladybug, Kùzu, RyuGraph | In eight read templates, use the engines' table-union syntax `:Post:Comment` for the logical `:Message` label. The fixture checks the union and derives the IS4 answer from the CSV. Other results need workload-level validation. |
+| [snb-typed-message](snb-typed-message/pack.json) | Ladybug, Kùzu, RyuGraph | Default for these engines. Eight canonical reads fail to bind `:Message` on their typed SNB stores. The rewrites use `:Post:Comment` to select both types. The fixture checks the union and derives the IS4 answer from the CSV. |
 | [finbench-cypher-jaccard](finbench-cypher-jaccard/pack.json) | All eight engines | Implement published TCR10 in Cypher using distinct companies, intersection and union counts, and specification rounding. This pack supersedes the default omission of the GDS call. The independent fixture tests 16 inputs on each engine. |
-| [finbench-map-projection](finbench-map-projection/pack.json) | GraphDBLite, Ladybug, Kùzu, RyuGraph | Return the same three TSR1 account fields as a literal map. The fixture checks the whole result against the input Account row. |
+| [finbench-map-projection](finbench-map-projection/pack.json) | GraphDBLite, Ladybug, Kùzu, RyuGraph | Default for Ladybug, Kùzu, and RyuGraph. Return the same three TSR1 account fields as a literal map. The fixture checks the whole result against the input Account row. |
 
 Each `pack.json` gives the suite, operation, target engines, original and replacement hashes, reason, and validation evidence. Replacement files contain complete statements for review. For example, `diff -u queries/finbench/tcr-10.cypher deviations/finbench-cypher-jaccard/TCR10.cypher` shows the Jaccard delta. The runner rejects packs with stale hashes or overlapping edits.
 

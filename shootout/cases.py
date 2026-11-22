@@ -5,6 +5,7 @@ from heapq import merge
 from itertools import islice
 import json
 from pathlib import Path
+from random import Random
 import re
 from tempfile import NamedTemporaryFile
 
@@ -47,19 +48,34 @@ def case(op, params, **extra):
     return {"op": op, "params": params, **extra}
 
 
-def sample_nodes(dataset, suite, limit):
+def sample_rows(records, limit, rng):
+    if rng is None:
+        return list(islice(records, limit))
+    sample = list(islice(records, limit))
+    for index, record in enumerate(records, start=limit + 1):
+        slot = rng.randrange(index)
+        if slot < limit:
+            sample[slot] = record
+    return sample
+
+
+def sample_nodes(dataset, suite, limit, *, seed=None, labels=()):
     entities = (snb_entities if suite == "snb" else finbench_entities)(dataset)
-    return {e.label: list(islice(rows(e), limit)) for e in entities if not e.pairs}
+    return {
+        e.label: sample_rows(rows(e), limit, Random(f"{seed}:{e.label}") if seed is not None else None)
+        for e in entities if not e.pairs and (not labels or e.label in labels)
+    }
 
 
-def snb_reads(dataset, directory, limit, operations=()):
+def snb_reads(dataset, directory, limit, operations=(), *, seed=None):
     for number in range(1, 15):
         operation = f"IC{number}"
         if operations and operation not in operations:
             continue
         path = directory / f"interactive_{number}_param.txt"
         with open_csv(path) as stream:
-            for row in islice(csv.DictReader(stream, delimiter="|"), limit):
+            records = csv.DictReader(stream, delimiter="|")
+            for row in sample_rows(records, limit, Random(f"{seed}:{operation}") if seed is not None else None):
                 params = {k: (v if k in SNB_TEXT else int(v)) for k, v in row.items()}
                 if "durationDays" in params:
                     params["endDate"] = params["startDate"] + params.pop("durationDays") * 86_400_000
@@ -68,7 +84,8 @@ def snb_reads(dataset, directory, limit, operations=()):
     shorts = [number for number in range(1, 8) if not operations or f"IS{number}" in operations]
     if not shorts:
         return
-    seeds = sample_nodes(dataset, "snb", limit)
+    labels = {"Person" if number <= 3 else "Comment" if number == 7 else "Post" for number in shorts}
+    seeds = sample_nodes(dataset, "snb", limit, seed=seed, labels=labels)
     cities = {}
     if 1 in shorts:
         people = {p["id"] for p in seeds["Person"]}
@@ -106,7 +123,7 @@ def fin_cell(key, cell):
     return value(cell, "INT64")
 
 
-def fin_reads(dataset, directory, limit, operations=()):
+def fin_reads(dataset, directory, limit, operations=(), *, seed=None):
     source = SOURCES["finbench"]
     if directory:
         for number, columns in FIN_COLUMNS.items():
@@ -122,7 +139,7 @@ def fin_reads(dataset, directory, limit, operations=()):
             with open_csv(path) as stream:
                 names = columns.split()
                 records = (r for r in csv.reader(stream, delimiter="|") if r and r != ["..."])
-                for record in islice(records, limit):
+                for record in sample_rows(records, limit, Random(f"{seed}:{official}") if seed is not None else None):
                     if len(record) != len(names):
                         raise ValueError(f"{path}: unexpected parameter width")
                     params = {k: fin_cell(k, v) for k, v in zip(names, record)}
@@ -136,7 +153,7 @@ def fin_reads(dataset, directory, limit, operations=()):
     shorts = [number for number in range(1, 7) if not operations or f"TSR{number}" in operations]
     if not shorts:
         return
-    accounts = sample_nodes(dataset, "finbench", limit)["Account"]
+    accounts = sample_nodes(dataset, "finbench", limit, seed=seed, labels=("Account",))["Account"]
     for number in shorts:
         for account in accounts:
             params = {"id": account["id"], "start_time": 0, "end_time": 4_102_444_800_000, "threshold": 0.0}
@@ -201,18 +218,36 @@ def update_cases(suite, directory: Path, limit):
         yield item
 
 
-def build(suite, dataset, params, per_read, updates, max_updates, operations=()):
+def build(suite, dataset, params, per_read, updates, max_updates, operations=(), *,
+          sample_seed=None, read_passes=1, warmup=False):
     if suite == "snb":
         if params is None:
             raise ValueError("SNB needs the published substitution parameter directory")
-        yield from snb_reads(dataset, params, per_read, operations)
+        reads = snb_reads(dataset, params, per_read, operations, seed=sample_seed)
     else:
-        yield from fin_reads(dataset, params, per_read, operations)
+        reads = fin_reads(dataset, params, per_read, operations, seed=sample_seed)
+    if read_passes == 1 and not warmup:
+        yield from reads
+    else:
+        scheduled = list(reads)
+        if warmup:
+            by_operation = {}
+            for item in scheduled:
+                if not item.get("omitted"):
+                    by_operation.setdefault(item["op"], item)
+            yield from ({**item, "warmup": True} for item in by_operation.values())
+        yield from (item for item in scheduled if item.get("omitted"))
+        measured = [item for item in scheduled if not item.get("omitted")]
+        rng = Random(sample_seed if sample_seed is not None else 0)
+        for _ in range(read_passes):
+            rng.shuffle(measured)
+            yield from measured
     if updates is not None and (not operations or any(op.startswith(("IU", "TW", "TRW")) for op in operations)):
         yield from update_cases(suite, updates, max_updates)
 
 
-def write_case_file(suite, dataset, params, out, *, per_read, updates, max_updates, operations):
+def write_case_file(suite, dataset, params, out, *, per_read, updates, max_updates, operations,
+                    sample_seed=None, read_passes=1, warmup=False):
     load(suite)
     out.parent.mkdir(parents=True, exist_ok=True)
     wanted = set(operations or ())
@@ -220,7 +255,8 @@ def write_case_file(suite, dataset, params, out, *, per_read, updates, max_updat
     with NamedTemporaryFile(mode="w", encoding="utf-8", dir=out.parent, delete=False) as stream:
         temporary = Path(stream.name)
         try:
-            for item in build(suite, dataset, params, per_read, updates, max_updates, wanted):
+            for item in build(suite, dataset, params, per_read, updates, max_updates, wanted,
+                              sample_seed=sample_seed, read_passes=read_passes, warmup=warmup):
                 operation = item.get("ldbc_op", item["op"])
                 if not wanted or operation in wanted:
                     seen.add(operation)

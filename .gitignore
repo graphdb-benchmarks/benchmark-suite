@@ -19,6 +19,7 @@ neo4j-community-*-unix.tar.gz
 
 # Benchmark reports, case lists, and logs written to custom output directories
 run.json
+trials.json
 matrix.json
 summary.jsonl
 matrix-summary.jsonl

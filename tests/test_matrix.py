@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from shootout import matrix
+from shootout import matrix, presets
 from shootout.__main__ import main
 from shootout.engines import DEFAULT_ENGINES
 
@@ -38,7 +38,7 @@ class Matrix(unittest.TestCase):
                     redirect_stdout(stdout):
                 self.assertEqual(main(), 0)
             plan = json.loads(stdout.getvalue())
-            self.assertEqual(plan["engines"], list(DEFAULT_ENGINES))
+            self.assertEqual(plan["engines"], sorted(DEFAULT_ENGINES))
             self.assertEqual(plan["rss_limit_bytes"], 15_000_000_000)
             self.assertEqual(plan["query_timeout"], 30)
             self.assertEqual(plan["query_deadline_policy"], "supervisor_process_group")
@@ -52,7 +52,8 @@ class Matrix(unittest.TestCase):
             out = Path(directory) / "selection"
             argv = ["shootout", "matrix", "--workload", "snb-sf10", "--workload", "finbench-sf1",
                     "--engine", "relate", "--engine", "velr", "--op", "IC1", "--op", "TSR1",
-                    "--rss-limit-gb", "24.5", "--query-timeout", "45", "--per-read", "1", "--out", str(out)]
+                    "--trials", "2", "--rss-limit-gb", "24.5", "--query-timeout", "45",
+                    "--per-read", "1", "--out", str(out)]
             with patch("sys.argv", argv), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()), \
                     patch.object(matrix.fetch, "snb", side_effect=OSError("download failed")), \
                     patch.object(matrix.fetch, "finbench") as fetch_finbench, \
@@ -63,9 +64,57 @@ class Matrix(unittest.TestCase):
             self.assertEqual(write_cases.call_args.kwargs["operations"], ["TSR1"])
             self.assertEqual(write_cases.call_args.kwargs["per_read"], 1)
             job = replay.call_args.args[0]
-            self.assertEqual((job.suite, job.scale, job.engine), ("finbench", "1", ["velr", "relate"]))
+            self.assertEqual((job.suite, job.scale, job.engine), ("finbench", "1", ["relate", "velr"]))
+            self.assertEqual(job.trials, 2)
             self.assertEqual(job.rss_limit_bytes, 24_500_000_000)
             self.assertEqual(job.query_timeout, 45)
             self.assertEqual(job.out, out / "finbench-sf1")
             summary = [json.loads(line) for line in (out / "matrix-summary.jsonl").read_text().splitlines()]
             self.assertEqual([row["status"] for row in summary], ["error", "complete"])
+            plan = json.loads((out / "matrix.json").read_text())
+            self.assertEqual([trial["engines"] for trial in plan["trials"]], [["relate", "velr"], ["velr", "relate"]])
+
+    def test_sf1_recipes_default_to_alphabetical_order_and_accept_explicit_engines(self):
+        for preset in ("sf1-p99", "sf1-quick"):
+            for options in ([], ["--engine=velr", "--engine", "grafeo", "--trials", "2"]):
+                with self.subTest(preset=preset, options=options), \
+                        patch("sys.argv", ["presets", preset, "results/sf1", *options]), \
+                        patch.object(presets, "prepare_workload", return_value=("snb", Path("data/snb/sf1"))), \
+                        patch("shootout.__main__.orchestrate", return_value=0) as replay:
+                    self.assertEqual(presets.main(), 0)
+                    job = replay.call_args.args[0]
+                    if options:
+                        self.assertEqual(job.engine, ["velr", "grafeo"])
+                        self.assertEqual(job.trials, 2)
+                    else:
+                        self.assertEqual(len(job.engine), 11)
+                        self.assertEqual(job.engine, sorted(job.engine))
+
+    def test_run_rotates_and_records_execution_order(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            dataset, schedule, out = root / "input", root / "source.jsonl", root / "run"
+            dataset.mkdir()
+            schedule.write_text('{"op":"IS1","params":{"personId":1},"expected":[]}\n')
+            arguments = ["run", "snb", "--scale", "fixture", "--dataset", str(dataset), "--cases", str(schedule),
+                         "--out", str(out), "--trials", "4", "--engine", "grafeo", "--engine", "velr", "--engine", "ladybug"]
+            failure = ("worker_failure", 1, 0, 0)
+            success = ("complete", 0, 0, 0)
+            with patch("shootout.run.check_rss_monitor"), redirect_stdout(io.StringIO()), \
+                    patch("shootout.run.replay_engine", side_effect=[failure] + [success] * 11) as replay:
+                self.assertEqual(main(arguments), 1)
+            orders = [["grafeo", "velr", "ladybug"], ["velr", "ladybug", "grafeo"],
+                      ["ladybug", "grafeo", "velr"], ["grafeo", "velr", "ladybug"]]
+            launches = [call.args[0] for call in replay.call_args_list]
+            self.assertEqual([job["engine"] for job in launches], [engine for order in orders for engine in order])
+            self.assertEqual(len({job["workdir"] for job in launches}), 12)
+            trials = json.loads((out / "trials.json").read_text())["trials"]
+            self.assertEqual([trial["engines"] for trial in trials], orders)
+            for number, (trial, order) in enumerate(zip(trials, orders, strict=True), 1):
+                self.assertEqual(trial["directory"], f"trial-{number:03d}")
+                trial_out = out / trial["directory"]
+                settings = json.loads((trial_out / "run.json").read_text())
+                self.assertEqual((settings["trial"], settings["engines"]), (number, order))
+                summary = [json.loads(line) for line in (trial_out / "summary.jsonl").read_text().splitlines()]
+                self.assertEqual([row["engine"] for row in summary], order)
+                self.assertEqual((trial_out / "cases.jsonl").read_bytes(), schedule.read_bytes())

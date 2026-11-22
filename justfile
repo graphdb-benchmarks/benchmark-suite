@@ -47,12 +47,20 @@ all *options:
 snb scale out *options:
     {{container}} python -m shootout.presets snb "$@"
 
-# Run the ten-engine SF1 comparison against the saved reference answers.
+# Run the eleven-engine SF1 comparison with 500 measured reads per operation.
 [positional-arguments]
 sf1-cohort out *options:
-    {{container}} python -m shootout.presets snb 1 "$@" --reference references/snb-sf1.json \
-        --engine velr --engine arcadedb --engine grafeo --engine graphqlite --engine ladybug --engine neug \
-        --engine neo4j --engine falkordb --engine memgraph --engine tugraph
+    {{container}} python -m shootout.presets sf1-p99 "$@" --reference references/snb-sf1-p99.json
+
+# Run the eleven-engine SF1 comparison with five inputs per operation.
+[positional-arguments]
+sf1-cohort-quick out *options:
+    {{container}} python -m shootout.presets sf1-quick "$@" --reference references/snb-sf1.json
+
+# Prepare the larger SF1 case file without running any engines.
+[positional-arguments]
+sf1-p99-cases out:
+    {{container}} python -m shootout.presets sf1-p99-cases "$@"
 
 # Download official SF1 or SF10 data and replay reads followed by updates.
 [positional-arguments]

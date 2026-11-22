@@ -35,6 +35,10 @@ def answer_rows(value):
     return isinstance(value, list) and all(isinstance(row, list) for row in value)
 
 
+def read_case_key(item):
+    return item["op"], serialized(item["params"])
+
+
 def equal_rows(rows, expected, unordered=False, *, suite=None, operation=None):
     collections = SNB_COLLECTIONS.get(operation, ()) if suite == "snb" else ()
     ties = SNB_TIES.get(operation, ()) if suite == "snb" else ()
@@ -62,8 +66,9 @@ def equal_rows(rows, expected, unordered=False, *, suite=None, operation=None):
 
 def load_reference(path, suite, scale, schedule_sha, listed, queries):
     pack = json.loads(path.read_bytes())
-    if (pack.get("format"), pack.get("suite"), pack.get("scale"), pack.get("cases_sha256")) != (
-        1, suite, scale, schedule_sha,
+    version = pack.get("format")
+    if version not in (1, 2) or (pack.get("suite"), pack.get("scale"), pack.get("cases_sha256")) != (
+        suite, scale, schedule_sha,
     ):
         raise ValueError(f"{path}: reference does not match this suite, scale and case schedule")
     answers = {}
@@ -79,4 +84,19 @@ def load_reference(path, suite, scale, schedule_sha, listed, queries):
         ):
             raise ValueError(f"{path}: reference disagrees with inline expected rows for case {number}")
         answers[number] = entry["rows"]
+    if version == 2:
+        unique = {read_case_key(listed[number]): rows for number, rows in answers.items()}
+        if len(unique) != len(answers):
+            raise ValueError(f"{path}: duplicate input in the reference answers")
+        for number, item in listed.items():
+            query = queries.get(item["op"])
+            key = read_case_key(item)
+            if query is None or query.kind != "read" or key not in unique:
+                raise ValueError(f"{path}: repeated-read reference does not cover case {number}")
+            rows = unique[key]
+            if number not in answers and "expected" in item and not equal_rows(
+                rows, item["expected"], item.get("unordered", False), suite=suite, operation=query.operation,
+            ):
+                raise ValueError(f"{path}: reference disagrees with inline expected rows for case {number}")
+            answers[number] = rows
     return answers

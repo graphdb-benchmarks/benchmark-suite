@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 from platform import machine
+import re
 import shutil
 import socket
 import subprocess
@@ -24,6 +25,7 @@ LINUX_ONLY_SERVERS = {"memgraph": "Memgraph", "tugraph": "TuGraph"}
 NEO4J_ARCHIVE = "fcbccee832175fd8b873ca7d8228dbde4cb5cce43f9053833cc7517dc4dd6f31"
 NEO4J_DIRECTORY = f"neo4j-community-{SERVER_VERSIONS['neo4j']}"
 NEO4J_DEFAULT = Path(__file__).resolve().parents[1] / "data" / "servers" / NEO4J_DIRECTORY
+NEO4J_MEMORY_KEYS = ("server.memory.heap.initial_size", "server.memory.heap.max_size", "server.memory.pagecache.size")
 
 
 def validate_server_platform(engines):
@@ -95,10 +97,40 @@ class ForegroundServer:
                     self.process.wait()
 
 
-def neo4j_config(path, port):
+def neo4j_home():
     home = Path(os.environ.get("SHOOTOUT_NEO4J_HOME", NEO4J_DEFAULT)).expanduser().resolve()
     if not (home / "bin" / "neo4j").is_file():
         raise FileNotFoundError(f"{home}: install with just setup-neo4j or set SHOOTOUT_NEO4J_HOME")
+    return home
+
+
+def neo4j_memory_settings(budget_bytes):
+    home = neo4j_home()
+    command = [home / "bin" / "neo4j-admin", "server", "memory-recommendation", f"--memory={budget_bytes // (1 << 20)}m"]
+    env = {**os.environ, "NEO4J_HOME": str(home), "NEO4J_CONF": str(home / "conf"), "HEAP_SIZE": "256m"}
+    try:
+        output = subprocess.check_output(command, text=True, env=env)
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError(f"Neo4j memory-recommendation exited with status {error.returncode}") from error
+    settings = {}
+    for line in output.splitlines():
+        key, _, value = line.partition("=")
+        if key in NEO4J_MEMORY_KEYS:
+            settings[key] = value.strip()
+    sizes = {}
+    for key in NEO4J_MEMORY_KEYS:
+        match = re.fullmatch(r"([1-9]\d*)([kmg])", settings.get(key, ""), re.IGNORECASE)
+        if not match:
+            raise ValueError(f"Neo4j did not recommend a valid value for {key}")
+        sizes[key] = int(match[1]) << {"k": 10, "m": 20, "g": 30}[match[2].lower()]
+    initial, maximum, page_cache = (sizes[key] for key in NEO4J_MEMORY_KEYS)
+    if initial != maximum or maximum + page_cache >= budget_bytes:
+        raise ValueError("Neo4j's recommended heap and page cache do not fit the available budget")
+    return settings
+
+
+def neo4j_config(path, port, memory=None):
+    home = neo4j_home()
     conf = path / "conf"
     conf.mkdir(parents=True, exist_ok=True)
     for name in ("server-logs.xml", "user-logs.xml", "neo4j-admin.conf"):
@@ -112,9 +144,7 @@ def neo4j_config(path, port):
         "dbms.usage_report.enabled": "false",
         "dbms.fleet_manager.enabled": "false",
         "server.fleet_discovery.enabled": "false",
-        "server.memory.heap.initial_size": "1G",
-        "server.memory.heap.max_size": "4G",
-        "server.memory.pagecache.size": "4G",
+        **(memory or {}),
     }
     defaults = (home / "conf" / "neo4j.conf").read_text().splitlines()
     (conf / "neo4j.conf").write_text("\n".join(
@@ -125,12 +155,12 @@ def neo4j_config(path, port):
 
 
 class Neo4jServer(ForegroundServer):
-    def __init__(self, path):
+    def __init__(self, path, *, memory=None):
         from neo4j import GraphDatabase
         from neo4j.exceptions import ServiceUnavailable
 
         port = loopback_port()
-        home, env = neo4j_config(path, port)
+        home, env = neo4j_config(path, port, memory)
 
         def connect():
             driver = GraphDatabase.driver(f"bolt://127.0.0.1:{port}", auth=None, telemetry_disabled=True,

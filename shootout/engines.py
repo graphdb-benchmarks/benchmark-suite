@@ -16,7 +16,7 @@ ENGINES = {
     "graphdblite": "graphdblite",
     "ryugraph": "ryugraph",
 }
-DEFAULT_ENGINES = tuple(ENGINES)
+DEFAULT_ENGINES = tuple(sorted(ENGINES))
 ENGINES.update(graphqlite="graphqlite", neug="neug")
 ENGINES.update(neo4j="neo4j", falkordb="FalkorDB", memgraph="pymgclient", tugraph="TuGraphClient")
 TYPED = {"ladybug", "kuzu", "ryugraph"}
@@ -37,12 +37,13 @@ def version(engine):
 
 
 class Database:
-    def __init__(self, engine, path, threads):
+    def __init__(self, engine, path, threads, *, neo4j_memory=None):
         self.engine = engine
         self.connection = None
         self.tx = None
         if engine in SERVER_CLASSES:
-            self.db = SERVER_CLASSES[engine](Path(path))
+            options = {"memory": neo4j_memory} if engine == "neo4j" else {}
+            self.db = SERVER_CLASSES[engine](Path(path), **options)
             self.query_rss_pid = self.db.query_pid
             return
         path = str(path)
