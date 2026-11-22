@@ -51,7 +51,7 @@ def open_tar(path):
             yield archive
 
 
-def tar_folder(path, root, destination):
+def tar_folder(path, root, destination, *, preserve_executable=False):
     if destination.is_dir():
         return
     prefix = PurePosixPath(root)
@@ -67,6 +67,8 @@ def tar_folder(path, root, destination):
             target.parent.mkdir(parents=True, exist_ok=True)
             with archive.extractfile(member) as source, target.open("xb") as stream:
                 shutil.copyfileobj(source, stream)
+            if preserve_executable and member.mode & 0o111:
+                target.chmod(0o755)
         if not any(Path(temp).iterdir()):
             raise ValueError(f"No files for {root} in {path}")
         Path(temp).rename(destination)

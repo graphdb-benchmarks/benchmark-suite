@@ -8,6 +8,8 @@ social_network-sf*.tar.zst
 substitution_parameters-sf*.tar.zst
 finbench-sf*.tar.gz
 finbench-sf*_read_params.zip
+neo4j-community-*-unix.tar.gz
+**/servers/neo4j-community-*/
 **/snb/sf[0-9]*/
 **/finbench/sf[0-9]*/
 **/fixtures/snb/converted/
@@ -30,6 +32,10 @@ ladybug.jsonl
 relate.jsonl
 ryugraph.jsonl
 velr.jsonl
+neo4j.jsonl
+falkordb.jsonl
+memgraph.jsonl
+tugraph.jsonl
 *.log
 
 # Database stores and staging files left by interrupted runs
@@ -39,6 +45,8 @@ velr.jsonl
 **/velr-????????/empty
 **/velr-????????/empty.*
 **/velr-????????/empty-*
+**/neo4j-????????/empty/
+**/tugraph-????????/empty/
 velr-csv-????????/
 *.db
 *.db-*

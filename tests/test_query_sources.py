@@ -6,7 +6,7 @@ import unittest
 
 from shootout.catalog import load
 from shootout.datasets import create_schema
-from shootout.engines import Database, ENGINES
+from shootout.engines import Database, DEFAULT_ENGINES
 from shootout.run import bind, disposition
 
 
@@ -29,7 +29,7 @@ class QuerySources(unittest.TestCase):
         self.assertEqual(upstream.text.replace(":Message", ":Post:Comment"), typed.text)
 
     def test_jaccard_on_published_drivers(self):
-        for engine in ENGINES:
+        for engine in DEFAULT_ENGINES:
             # Kùzu and RyuGraph register native types with the same names.
             with self.subTest(engine=engine):
                 run = subprocess.run([sys.executable, "-m", "tests.test_query_sources", engine],

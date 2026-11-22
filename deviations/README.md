@@ -22,3 +22,9 @@ The typed message pack passed the IS4 fixture on Ladybug, Kùzu, and RyuGraph. A
 ## Snapshot wiring
 
 SNB keeps the logical node labels of the upstream loader. The typed engines use concrete node tables and grouped relationship tables. ArcadeDB represents parent labels as vertex type inheritance. All FinBench engines use the short relationship names from the Neo4j templates and the same input types, including signed 64-bit IDs and epoch milliseconds. These are load-time mappings. The case texts stay in the query catalog and explicit packs. Velr uses the published `velr-admin` bulk importer against normalized CSV, then the pinned Python driver executes the workload.
+
+Neo4j, FalkorDB, and Memgraph load the shared SNB labels alongside the concrete labels. TuGraph's typed schema assigns one label to each vertex, so its load uses concrete labels such as `Post` and `Comment`. The SNB `email` and `speaks` lists use JSON-formatted string properties because the TuGraph bulk schema supports scalar types. The replay uses the canonical statements and checks the complete returned values against the saved reference, including the difference between a string and a list. [TuGraph bulk schema](https://tugraph-db.readthedocs.io/en/latest/6.utility-tools/1.data-import.html)
+
+The FalkorDB CSV bulk loader trims text fields and infers array element types. The timed import restores affected strings and string arrays in indexed batches before saving the store. [FalkorDB CSV bulk loader](https://github.com/FalkorDB/falkordb-bulk-loader)
+
+The TuGraph Python SDK exposes Cypher over REST. The runner sends the REST API's `parameters` field through the pinned SDK transport so the server receives the catalog statement and its parameters separately. [TuGraph Python SDK](https://tugraph-db.readthedocs.io/en/latest/7.client-tools/1.python-client.html), [REST parameter binding](https://tugraph-db.readthedocs.io/en/v4.5.0/7.client-tools/9.restful-api-legacy.html)

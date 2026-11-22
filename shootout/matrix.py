@@ -7,10 +7,12 @@ import sys
 from tempfile import TemporaryDirectory
 
 from . import fetch
+from .bulk_import import LOAD_METHODS
 from .cases import write_case_file
 from .catalog import SOURCES
 from .run import engine_order, orchestrate, write_line
-from .supervision import QUERY_DEADLINE_POLICY, RSS_SAMPLE_INTERVAL
+from .servers import validate_server_platform
+from .supervision import QUERY_DEADLINE_POLICY, QUERY_RSS_POLICY, RSS_SAMPLE_INTERVAL
 
 WORKLOADS = {f"{suite}-sf{scale}": (suite, scale) for suite in SOURCES for scale in ("1", "10")}
 
@@ -26,6 +28,12 @@ def make_plan(args):
     workloads = list(WORKLOADS) if args.all_workloads else args.workload
     if len(set(workloads)) != len(workloads):
         raise ValueError("remove duplicate --workload options")
+    references = {}
+    for spec in args.reference:
+        name, _, file = spec.partition("=")
+        if name not in workloads or not file or name in references:
+            raise ValueError(f"Invalid or duplicate --reference {spec!r}. Use WORKLOAD=FILE for a selected workload")
+        references[name] = file
     requested = list(dict.fromkeys(args.op or ()))
     supported = set().union(*(published_operations(WORKLOADS[name][0]) for name in workloads))
     if unknown := set(requested) - supported:
@@ -48,19 +56,24 @@ def make_plan(args):
             "workload": name, "suite": suite, "scale": scale, "operations": operations,
             "dataset": str(dataset), "params": str(params),
             "updates": str(updates) if args.mixed else None, "out": str(destination / name),
+            "reference": references.get(name),
         })
+    engines = engine_order(args.engine)
     return {
-        "out": str(destination), "engines": engine_order(args.engine), "packs": args.pack,
+        "out": str(destination), "engines": engines, "packs": args.pack,
+        "loaders": {engine: LOAD_METHODS[engine] for engine in engines},
         "per_read": args.per_read, "max_updates": args.max_updates, "mixed": args.mixed,
         "skip_fetch": args.skip_fetch, "batch_size": args.batch_size, "threads": args.threads,
         "query_timeout": args.query_timeout, "worker_timeout": args.timeout,
         "query_deadline_policy": QUERY_DEADLINE_POLICY,
+        "query_rss_policy": QUERY_RSS_POLICY,
         "rss_limit_bytes": args.rss_limit_bytes, "rss_sample_interval_seconds": RSS_SAMPLE_INTERVAL,
         "jobs": jobs,
     }
 
 
 def run_matrix(args, plan):
+    validate_server_platform(plan["engines"])
     destination = Path(plan["out"])
     destination.mkdir(parents=True)
     (destination / "matrix.json").write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
@@ -90,6 +103,7 @@ def run_matrix(args, plan):
                         engine=plan["engines"], pack=args.pack, batch_size=args.batch_size, threads=args.threads,
                         query_timeout=args.query_timeout, timeout=args.timeout,
                         rss_limit_bytes=plan["rss_limit_bytes"],
+                        reference=Path(job["reference"]) if job["reference"] else None,
                     ))
                     report["status"] = "worker_failure" if result else "complete"
                 except Exception as error:

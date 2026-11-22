@@ -1,8 +1,10 @@
-"""Public in-process Python APIs. Workload Cypher always comes from the catalog."""
+"""Public Python APIs. Workload Cypher always comes from the catalog."""
 
 from contextlib import contextmanager
 from importlib import import_module, metadata
 from pathlib import Path
+
+from .servers import SERVER_CLASSES, SERVER_VERSIONS
 
 ENGINES = {
     "velr": "velr",
@@ -14,10 +16,15 @@ ENGINES = {
     "graphdblite": "graphdblite",
     "ryugraph": "ryugraph",
 }
+DEFAULT_ENGINES = tuple(ENGINES)
+ENGINES.update(graphqlite="graphqlite", neug="neug")
+ENGINES.update(neo4j="neo4j", falkordb="FalkorDB", memgraph="pymgclient", tugraph="TuGraphClient")
 TYPED = {"ladybug", "kuzu", "ryugraph"}
+TABLE_ENGINES = TYPED | {"neug"}
 PINS = dict(
     line.split("==", 1)
-    for line in (Path(__file__).resolve().parents[1] / "requirements.txt").read_text().splitlines()
+    for file in ("requirements.txt", "requirements-candidates.txt", "requirements-server.txt")
+    for line in (Path(__file__).resolve().parents[1] / file).read_text().splitlines()
 )
 
 
@@ -34,6 +41,10 @@ class Database:
         self.engine = engine
         self.connection = None
         self.tx = None
+        if engine in SERVER_CLASSES:
+            self.db = SERVER_CLASSES[engine](Path(path))
+            self.query_rss_pid = self.db.query_pid
+            return
         path = str(path)
         if engine in TYPED:
             mod = import_module(engine)
@@ -61,6 +72,15 @@ class Database:
             from graphdblite import Database as GraphDBLite
 
             self.db = GraphDBLite(path)
+        elif engine == "graphqlite":
+            from graphqlite import Graph
+
+            self.db = Graph(path)
+        elif engine == "neug":
+            from neug import Database as NeuG
+
+            self.db = NeuG(path, max_thread_num=threads)
+            self.connection = self.db.connect()
         else:
             raise ValueError(f"Unknown engine {engine}")
 
@@ -78,6 +98,8 @@ class Database:
         params = params or {}
         engine = self.engine
         client = self.tx if self.tx is not None else self.db
+        if engine in SERVER_VERSIONS:
+            return client.execute(cypher, params)
         if engine in TYPED:
             result = self.connection.execute(cypher, params)
             if isinstance(result, list):
@@ -108,6 +130,10 @@ class Database:
                 with self.transaction():
                     return self.execute(cypher, params, write=True)
             return [list(row.values()) for row in client.query(cypher, params)]
+        if engine == "graphqlite":
+            return [list(row.values()) for row in client.query(cypher, params)]
+        if engine == "neug":
+            return list(self.connection.execute(cypher, parameters=params))
         call = client.command if write else client.query
         with call("opencypher", cypher, params) as result:
             return [list(row.values()) for row in result.iter_dicts()]
@@ -126,6 +152,9 @@ class Database:
         elif engine == "arcadedb":
             client.begin()
             commit, rollback = client.commit, client.rollback
+        elif engine == "neug":
+            self.connection.begin_transaction()
+            commit, rollback = self.connection.commit, self.connection.rollback
         else:
             begin = {
                 "velr": "begin_tx",

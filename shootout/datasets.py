@@ -1,18 +1,17 @@
 """Stream the upstream SNB v1 composite and FinBench snapshot CSV layouts."""
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from contextlib import closing
 import csv
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import gzip
-from itertools import batched
 from pathlib import Path
 import re
 import sqlite3
 
 from .catalog import ROOT
-from .engines import TYPED
+from .engines import TABLE_ENGINES
 
 ID = "INT64"
 TEXT = "STRING"
@@ -170,6 +169,16 @@ def finbench_entities(root):
                      FIN_RELATIONSHIPS.get(label, label), pairs, spaces)
 
 
+def first_person_id(suite, root):
+    entities = (snb_entities if suite == "snb" else finbench_entities)(root)
+    person = next(entity for entity in entities if entity.label == "Person" and not entity.pairs)
+    with closing(rows(person)) as people:
+        first = next(people, None)
+    if first is None:
+        raise ValueError("Snapshot input contains no Person")
+    return first["id"]
+
+
 def props(columns):
     return ", ".join(f"`{key}`: r.`{key}`" for key in columns)
 
@@ -179,7 +188,7 @@ def types(columns):
 
 
 def create_schema(db, nodes, edges):
-    if db.engine in TYPED:
+    if db.engine in TABLE_ENGINES:
         for label, columns in nodes.items():
             db.execute(f"CREATE NODE TABLE {label}({types(columns)}, PRIMARY KEY (id))", write=True)
         for rel, (pairs, columns) in edges.items():
@@ -209,7 +218,17 @@ def arcade_sql(db, text):
 
 
 def id_indexes(db, labels):
-    if db.engine == "grafeo":
+    if db.engine == "neo4j":
+        labels = set(labels)
+        if {"Post", "Comment"} & labels:
+            labels.add("Message")
+        for label, subtypes in LABELS.items():
+            if labels.intersection(subtypes):
+                labels.add(label)
+        for label in sorted(labels):
+            db.execute(f"CREATE INDEX IF NOT EXISTS FOR (n:{label}) ON (n.id)", write=True)
+        db.execute("CALL db.awaitIndexes(300)")
+    elif db.engine == "grafeo":
         db.db.create_property_index("id")
     elif db.engine == "graphdblite":
         with db.transaction():
@@ -220,98 +239,38 @@ def id_indexes(db, labels):
             db.execute(f"CREATE INDEX FOR (n:{label}) ON (n.id)", write=True)
 
 
-def load_snapshot(db, suite, root: Path, batch_size):
+def verify_graphdblite_snapshot(path, counts):
+    # GraphDBLite 0.2.0's Python binding caps rows in the scan before count().
+    # The pinned storage format keeps one edge_props row per edge, even with no properties.
+    # Its key contains two 8-byte IDs, the UTF-8 label, a NUL and an 8-byte sequence.
+    uri = path.resolve().as_uri() + "?mode=ro"
+    actual = Counter()
+    with closing(sqlite3.connect(uri, uri=True)) as store:
+        total_nodes = 0
+        for labels, number in store.execute("SELECT label, count(*) FROM nodes GROUP BY label"):
+            total_nodes += number
+            for label in labels.split(":"):
+                actual["node", label] += number
+        for label, number in store.execute(
+            "SELECT CAST(substr(key, 17, length(key) - 25) AS TEXT), count(*) FROM edge_props GROUP BY 1"
+        ):
+            actual["edge", label] = number
+    for (kind, label), expected in counts.items():
+        if actual[kind, label] != expected:
+            raise ValueError(f"{kind} {label}: snapshot has {actual[kind, label]}, expected {expected}")
+    for kind, total in (("node", total_nodes), ("edge", sum(n for (kind, _), n in actual.items() if kind == "edge"))):
+        expected = sum(n for (count_kind, _), n in counts.items() if count_kind == kind)
+        if total != expected:
+            raise ValueError(f"Total {kind} count: snapshot has {total}, expected {expected}")
+
+
+def verify_snapshot(db, counts, path):
     if db.engine == "graphdblite":
-        # Resolve external IDs for the native bulk edge API without keeping the graph in Python memory.
-        with closing(sqlite3.connect("")) as ids:
-            ids.execute("CREATE TABLE ids(label TEXT, external INTEGER, internal INTEGER, PRIMARY KEY(label, external))")
-            return _load_snapshot(db, suite, root, batch_size, ids)
-    return _load_snapshot(db, suite, root, batch_size, None)
-
-
-def _load_snapshot(db, suite, root, batch_size, ids):
-    entities = list((snb_entities if suite == "snb" else finbench_entities)(root))
-    nodes = [entity for entity in entities if not entity.pairs]
-    edges = [entity for entity in entities if entity.pairs]
-    tables = {
-        label: {key: typ for key, typ in e.columns if key != "_label"}
-        for e in nodes for label in (LABELS.get(e.label, (e.label,)) if suite == "snb" else (e.label,))
-    }
-    relationships = {}
-    for e in edges:
-        pairs, columns = relationships.setdefault(e.label, (set(), {}))
-        pairs.update(e.pairs)
-        columns.update((key, typ) for key, typ in e.columns if not key.startswith("_"))
-    create_schema(db, tables, relationships)
-    typed = db.engine in TYPED
-    types_only = typed or db.engine == "arcadedb"
-    subtypes = {"Organisation": {}, "Place": {}}
-    counts = defaultdict(int)
-    for e in nodes:
-        cols = [k for k, _ in e.columns if k != "_label"]
-        for batch in batched(rows(e), batch_size):
-            groups = defaultdict(list)
-            for row in batch:
-                subtype = row.pop("_label", None)
-                label = e.label
-                if subtype is not None:
-                    label = subtype.title()
-                    if label not in LABELS[e.label]:
-                        raise ValueError(f"Unexpected {e.label} subtype {subtype}")
-                    subtypes[e.label][row["id"]] = label
-                groups[label].append(row)
-            for label, group in groups.items():
-                qualifier = label
-                if suite == "snb" and not types_only:
-                    if label in {"Post", "Comment"}:
-                        qualifier += ":Message"
-                    elif label != e.label:
-                        qualifier += f":{e.label}"
-                query = f"UNWIND $rows AS r CREATE (n:{qualifier} {{{props(cols)}}})"
-                if ids is None:
-                    db.execute(query, {"rows": group}, write=True)
-                else:
-                    inserted = db.execute(query + " RETURN n.id AS external, id(n) AS internal",
-                                          {"rows": group}, write=True)
-                    ids.executemany("INSERT INTO ids VALUES (?, ?, ?)", ((label, ext, internal) for ext, internal in inserted))
-                counts[("node", label)] += len(group)
-    id_indexes(db, tables)
-    for e in edges:
-        cols = [key for key, _ in e.columns if not key.startswith("_")]
-        for batch in batched(rows(e), batch_size):
-            groups = defaultdict(list)
-            for row in batch:
-                src, dst = e.spaces
-                src = subtypes[src][row["_src"]] if suite == "snb" and src in subtypes else src
-                dst = subtypes[dst][row["_dst"]] if suite == "snb" and dst in subtypes else dst
-                if (src, dst) not in e.pairs:
-                    raise ValueError(f"Unexpected endpoints {(src, dst)} for {e.label}")
-                groups[(src, dst)].append(row)
-            for (src, dst), group in groups.items():
-                query = (
-                    f"UNWIND $rows AS r MATCH (a:{src} {{id: r._src}}) "
-                    f"MATCH (b:{dst} {{id: r._dst}}) CREATE (a)-[:{e.label} {{{props(cols)}}}]->(b)"
-                )
-                if ids is None:
-                    db.execute(query, {"rows": group}, write=True)
-                else:
-                    def lookup(label, external):
-                        found = ids.execute("SELECT internal FROM ids WHERE label = ? AND external = ?", (label, external)).fetchone()
-                        if found is None:
-                            raise ValueError(f"Missing {label} endpoint {external}")
-                        return found[0]
-
-                    payload = [(lookup(src, row["_src"]), lookup(dst, row["_dst"]),
-                                {key: row[key] for key in cols if row[key] is not None}) for row in group]
-                    with db.transaction():
-                        db.tx.batch_create_edges(e.label, payload)
-                counts[("edge", e.label)] += len(group)
-    return counts
-
-
-def verify_snapshot(db, counts):
+        verify_graphdblite_snapshot(path, counts)
+        return "sqlite_storage_counts"
     for (kind, label), expected in counts.items():
         pattern, alias = (f"(x:{label})", "x") if kind == "node" else (f"()-[x:{label}]->()", "x")
         number = db.execute(f"MATCH {pattern} RETURN count({alias}) AS n")
         if number != [[expected]]:
             raise ValueError(f"{kind} {label}: snapshot has {number}, expected {expected}")
+    return "cypher_counts"

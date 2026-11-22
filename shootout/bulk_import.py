@@ -10,15 +10,21 @@ import sqlite3
 from tempfile import TemporaryDirectory
 
 from .datasets import LABELS, create_schema, finbench_entities, id_indexes, props, rows, snb_entities
-from .engines import TYPED
+from .engines import TABLE_ENGINES, TYPED
 
 LOAD_METHODS = {
     **dict.fromkeys(TYPED, "copy_parquet"),
     "velr": "velr-admin",
     "relate": "batched_cypher",
     "grafeo": "typed_csv_and_native_node_batches",
-    "arcadedb": "graph_batch",
+    "arcadedb": "graph_batch_serial_flush",
     "graphdblite": "native_batches_and_multilabel_cypher",
+    "graphqlite": "native_bulk_nodes_edges_with_snb_schema_normalization",
+    "neug": "typed_csv_copy_one_transaction",
+    "neo4j": "neo4j_admin_full_import",
+    "falkordb": "falkordb_bulk_insert",
+    "memgraph": "load_csv_analytical",
+    "tugraph": "lgraph_import",
 }
 GRAFEO_TYPES = {"INT64": "int64", "STRING": "string", "DOUBLE": "float64", "BOOL": "bool"}
 
@@ -133,7 +139,10 @@ def import_batches(db, suite, nodes, edges, tables, subtypes, counts, size):
                 "CREATE TABLE ids(label TEXT, external INTEGER, internal NOT NULL, "
                 "PRIMARY KEY(label, external)) WITHOUT ROWID"
             )
-        arcade = stack.enter_context(db.db.graph_batch(use_wal=True) if db.engine == "arcadedb" else nullcontext())
+        arcade = stack.enter_context(
+            db.db.graph_batch(use_wal=True, parallel_flush=False, commit_every=0)
+            if db.engine == "arcadedb" else nullcontext()
+        )
         for entity in nodes:
             columns = [key for key, _ in entity.columns if key != "_label"]
             for label, group in node_groups(entity, subtypes, size):
@@ -230,6 +239,88 @@ def import_grafeo(db, suite, folder, nodes, edges, tables, subtypes, counts, siz
             counts["edge", entity.label] += len(group)
 
 
+def import_graphqlite(db, suite, nodes, edges, subtypes, counts, size):
+    graph = db.db
+    ids, aliases = {}, set()
+    for entity in nodes:
+        for label, group in node_groups(entity, subtypes, size):
+            records = [(f'{entity.label}:{row["id"]}', non_null(row), label) for row in group]
+            inserted = graph.insert_nodes_bulk(records)
+            if len(inserted) != len(records) or ids.keys() & inserted.keys():
+                raise ValueError(f"Duplicate {entity.label} IDs in GraphQLite import")
+            ids.update(inserted)
+            aliases.update((label, other) for other in node_labels(entity, label, suite) if other != label)
+            counts["node", label] += len(group)
+    for entity in edges:
+        src, dst = entity.spaces
+        for batch in batched(rows(entity), size):
+            records = [(f'{src}:{row["_src"]}', f'{dst}:{row["_dst"]}',
+                        {key: value for key, value in row.items() if not key.startswith("_") and value is not None},
+                        entity.label) for row in batch]
+            if any(src_id not in ids or dst_id not in ids for src_id, dst_id, _, _ in records):
+                raise ValueError(f"Missing GraphQLite endpoint for {entity.label}")
+            count = graph.insert_edges_bulk(records, ids)
+            if count != len(records):
+                raise ValueError(f"GraphQLite imported {count} of {len(records)} {entity.label} edges")
+            counts["edge", entity.label] += count
+
+    # The documented SQLite schema stores external text IDs and integer id
+    # properties separately. Remove the helper IDs after resolving the edges.
+    conn = graph.connection.sqlite_connection
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        key_id, = conn.execute("SELECT id FROM property_keys WHERE key = 'id'").fetchone()
+        typed_ids, = conn.execute("SELECT count(*) FROM node_props_int WHERE key_id = ?", (key_id,)).fetchone()
+        if typed_ids != len(ids):
+            raise ValueError(f"GraphQLite has {typed_ids} integer IDs for {len(ids)} nodes")
+        conn.execute("DELETE FROM node_props_text WHERE key_id = ?", (key_id,))
+        conn.executemany(
+            "INSERT OR IGNORE INTO node_labels (node_id, label) SELECT node_id, ? FROM node_labels WHERE label = ?",
+            [(alias, label) for label, alias in sorted(aliases)],
+        )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def stage_neug_csv(folder, groups, columns):
+    files, counts = {}, defaultdict(int)
+    with ExitStack() as stack:
+        writers = {}
+        for key, group in groups:
+            if key not in writers:
+                path = folder / f"{len(files)}.csv"
+                stream = stack.enter_context(path.open("w", encoding="utf-8", newline=""))
+                writers[key] = csv.writer(stream, delimiter="|", lineterminator="\n")
+                writers[key].writerow(columns)
+                files[key] = path
+            for row in group:
+                writers[key].writerow([f"[{','.join(value)}]" if isinstance(value, list) else value
+                                       for value in (row[name] for name in columns)])
+            counts[key] += len(group)
+    return files, counts
+
+
+def import_neug(db, folder, nodes, edges, subtypes, counts, size):
+    options = "header=true, escaping=false, auto_detect=false"
+    for entity in nodes:
+        columns = [key for key, _ in entity.columns if key != "_label"]
+        files, staged = stage_neug_csv(folder, node_groups(entity, subtypes, size), columns)
+        for label, path in files.items():
+            db.execute(f"COPY {label} FROM {json.dumps(str(path))} ({options})", write=True)
+            counts["node", label] += staged[label]
+            path.unlink()
+    for entity in edges:
+        # NeuG takes the primary-key columns first, followed by edge properties.
+        columns = ["_src", "_dst", *(key for key, _ in entity.columns if not key.startswith("_"))]
+        files, staged = stage_neug_csv(folder, edge_groups(entity, subtypes, size), columns)
+        for (src, dst), path in files.items():
+            db.execute(f"COPY {entity.label} FROM {json.dumps(str(path))} ({options}, from='{src}', to='{dst}')", write=True)
+            counts["edge", entity.label] += staged[src, dst]
+            path.unlink()
+
+
 def load_snapshot(db, suite, root, batch_size, *, workdir=None):
     entities = list((snb_entities if suite == "snb" else finbench_entities)(root))
     nodes = [entity for entity in entities if not entity.pairs]
@@ -243,10 +334,17 @@ def load_snapshot(db, suite, root, batch_size, *, workdir=None):
         pairs, columns = relationships.setdefault(entity.label, (set(), {}))
         pairs.update(entity.pairs)
         columns.update((key, kind) for key, kind in entity.columns if not key.startswith("_"))
-    create_schema(db, tables, relationships)
     subtypes = {"Organisation": {}, "Place": {}} if suite == "snb" else {}
     counts = defaultdict(int)
-    if db.engine in TYPED or db.engine == "grafeo":
+    if db.engine == "neug":
+        with TemporaryDirectory(prefix="bulk-", dir=workdir) as directory, db.transaction():
+            create_schema(db, tables, relationships)
+            import_neug(db, Path(directory), nodes, edges, subtypes, counts, max(65_536, batch_size))
+        return counts
+    create_schema(db, tables, relationships)
+    if db.engine == "graphqlite":
+        import_graphqlite(db, suite, nodes, edges, subtypes, counts, batch_size)
+    elif db.engine in TABLE_ENGINES or db.engine == "grafeo":
         with TemporaryDirectory(prefix="bulk-", dir=workdir) as directory:
             folder = Path(directory)
             if db.engine in TYPED:

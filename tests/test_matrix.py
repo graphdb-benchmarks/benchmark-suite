@@ -8,10 +8,28 @@ from unittest.mock import patch
 
 from shootout import matrix
 from shootout.__main__ import main
-from shootout.engines import ENGINES
+from shootout.engines import DEFAULT_ENGINES
 
 
 class Matrix(unittest.TestCase):
+    def test_linux_only_servers_are_rejected_before_preparing_runs_on_macos(self):
+        commands = [
+            ["matrix", "--workload", "snb-sf1"],
+            ["run", "snb", "--scale", "1", "--dataset", "missing", "--cases", "missing.jsonl"],
+        ]
+        with TemporaryDirectory() as directory:
+            out = Path(directory) / "new results"
+            for command in commands:
+                with self.subTest(command=command[0]):
+                    argv = ["shootout", *command, "--engine", "memgraph", "--engine", "tugraph", "--out", str(out)]
+                    stderr = io.StringIO()
+                    with patch("sys.platform", "darwin"), patch("sys.argv", argv), redirect_stderr(stderr):
+                        with self.assertRaises(SystemExit) as exit_code:
+                            main()
+                    self.assertEqual(exit_code.exception.code, 2)
+                    self.assertIn("Memgraph, TuGraph require a Linux host", stderr.getvalue())
+                    self.assertFalse(out.exists())
+
     def test_all_lists_every_workload_and_engine_without_creating_output(self):
         with TemporaryDirectory() as directory:
             out = Path(directory) / "new results"
@@ -20,7 +38,7 @@ class Matrix(unittest.TestCase):
                     redirect_stdout(stdout):
                 self.assertEqual(main(), 0)
             plan = json.loads(stdout.getvalue())
-            self.assertEqual(plan["engines"], list(ENGINES))
+            self.assertEqual(plan["engines"], list(DEFAULT_ENGINES))
             self.assertEqual(plan["rss_limit_bytes"], 15_000_000_000)
             self.assertEqual(plan["query_timeout"], 30)
             self.assertEqual(plan["query_deadline_policy"], "supervisor_process_group")

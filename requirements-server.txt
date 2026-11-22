@@ -1,0 +1,4 @@
+neo4j==6.4.1
+FalkorDB==1.8.2
+pymgclient==1.6.0
+TuGraphClient==2.0

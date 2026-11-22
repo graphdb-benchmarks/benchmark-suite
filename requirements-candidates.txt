@@ -1,0 +1,2 @@
+graphqlite==1.0.0
+neug==0.3.1
