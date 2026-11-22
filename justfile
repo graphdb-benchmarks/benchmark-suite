@@ -37,7 +37,7 @@ smoke out="results/smoke":
 selected *options:
     {{container}} python -m shootout matrix "$@"
 
-# Run SNB and FinBench at SF1 and SF10 on all eight engines by default.
+# Run SNB and FinBench at SF1 and SF10 on the eight default engines.
 [positional-arguments]
 all *options:
     {{container}} python -m shootout matrix --all-workloads "$@"
@@ -47,12 +47,12 @@ all *options:
 snb scale out *options:
     {{container}} python -m shootout.presets snb "$@"
 
-# Run the eleven-engine SF1 comparison with 500 measured reads per operation.
+# Run the nine-engine SF1 comparison with 500 measured reads per operation.
 [positional-arguments]
 sf1-cohort out *options:
     {{container}} python -m shootout.presets sf1-p99 "$@" --reference references/snb-sf1-p99.json
 
-# Run the eleven-engine SF1 comparison with five inputs per operation.
+# Run the nine-engine SF1 comparison with five inputs per operation.
 [positional-arguments]
 sf1-cohort-quick out *options:
     {{container}} python -m shootout.presets sf1-quick "$@" --reference references/snb-sf1.json

@@ -75,20 +75,21 @@ class Matrix(unittest.TestCase):
             self.assertEqual([trial["engines"] for trial in plan["trials"]], [["relate", "velr"], ["velr", "relate"]])
 
     def test_sf1_recipes_default_to_alphabetical_order_and_accept_explicit_engines(self):
+        selections = (
+            ([], ["arcadedb", "falkordb", "grafeo", "graphqlite", "ladybug", "memgraph", "neo4j", "relate", "velr"], 1),
+            (["--engine=velr", "--engine", "grafeo", "--trials", "2"], ["velr", "grafeo"], 2),
+            (["--engine", "tugraph", "--engine", "neug"], ["tugraph", "neug"], 1),
+        )
         for preset in ("sf1-p99", "sf1-quick"):
-            for options in ([], ["--engine=velr", "--engine", "grafeo", "--trials", "2"]):
+            for options, engines, trials in selections:
                 with self.subTest(preset=preset, options=options), \
                         patch("sys.argv", ["presets", preset, "results/sf1", *options]), \
                         patch.object(presets, "prepare_workload", return_value=("snb", Path("data/snb/sf1"))), \
                         patch("shootout.__main__.orchestrate", return_value=0) as replay:
                     self.assertEqual(presets.main(), 0)
                     job = replay.call_args.args[0]
-                    if options:
-                        self.assertEqual(job.engine, ["velr", "grafeo"])
-                        self.assertEqual(job.trials, 2)
-                    else:
-                        self.assertEqual(len(job.engine), 11)
-                        self.assertEqual(job.engine, sorted(job.engine))
+                    self.assertEqual(job.engine, engines)
+                    self.assertEqual(job.trials, trials)
 
     def test_run_rotates_and_records_execution_order(self):
         with TemporaryDirectory() as directory:

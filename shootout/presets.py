@@ -8,7 +8,7 @@ from .__main__ import main as benchmark_cli
 from .engines import DEFAULT_ENGINES
 
 SF1_COHORT_ENGINES = (
-    "arcadedb", "falkordb", "grafeo", "graphqlite", "ladybug", "memgraph", "neo4j", "neug", "relate", "tugraph", "velr",
+    "arcadedb", "falkordb", "grafeo", "graphqlite", "ladybug", "memgraph", "neo4j", "relate", "velr",
 )
 SF1_P99_CASE_OPTIONS = ("--per-read", "50", "--sample-seed", "42", "--read-passes", "10", "--warmup")
 

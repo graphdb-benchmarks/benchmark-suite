@@ -20,7 +20,7 @@ Install `just`, CPython 3.12, and Docker with a Linux runtime. `just setup` buil
 
 Each benchmark invocation runs all selected engines in one container. The image includes the pinned PyPI drivers and the published server and loader binaries required by the engines. The runner stages each dataset once on the container's Linux filesystem before timing any engine and creates a fresh store for each engine in each trial. It saves results to the workspace and records the image ID, architecture, CPU count, and visible host memory in `run.json`.
 
-The Docker runner sets Relate’s per-expression value limit to **512 MiB** with `RELATE_EXPRESSION_MEMORY_LIMIT=512mib` and records it in `run.json` when Relate is selected. The benchmark’s process-tree RSS cap still applies. [Relate limits](https://relatedb.ai/docs/reference/storage/limits-and-sizing/)
+Relate uses its default **256 MiB per-expression limit** for individual values such as intermediate lists, strings, and maps. The benchmark’s process-tree RSS cap applies to the whole worker. [Relate limits](https://relatedb.ai/docs/reference/storage/limits-and-sizing/)
 
 Input and output paths under the repository are shared with the container. For paths outside the repository, set `SHOOTOUT_DOCKER_MOUNTS` to a colon-separated list of existing host directories.
 
@@ -33,7 +33,15 @@ just sf1-cohort results/snb-sf1-cohort
 
 The smoke run downloads the public fixtures, loads the same logical snapshot in each engine, and exercises a small set of canonical reads. It records query refusals, mismatches, and timeouts as benchmark outcomes. It uses smaller inputs and shorter time limits than the scale runs. Use a new output directory for each run, such as `just smoke results/smoke-repeat`.
 
-`just sf1-cohort` runs eleven engines against checked-in expected answers for 50 distinct inputs per operation. The recipe samples inputs with seed 42, runs one warm-up query per operation, then shuffles the same inputs across ten measured passes. That gives 500 response measurements per operation and 10,500 per engine. The report excludes the warm-up cases, whose outcomes remain in the raw logs. The recipe allows up to 24 hours per engine by default. `just sf1-cohort-quick` runs the five-input schedule for quicker checks.
+`just sf1-cohort` runs nine engines by default against checked-in expected answers for 50 distinct inputs per operation. The recipe samples inputs with seed 42, runs one warm-up query per operation, then shuffles the same inputs across ten measured passes. That gives 500 response measurements per operation and 10,500 per engine. The report excludes the warm-up cases, whose outcomes remain in the raw logs. The recipe allows up to 24 hours per engine by default. `just sf1-cohort-quick` runs the five-input schedule for quicker checks.
+
+> [!NOTE]
+> **Relate and GraphQLite can lengthen SF1 test runs.** The recorded Linux ARM64 SNB SF1 runs used 105 cases per engine.
+>
+> - **Relate took 33m 31s.** Import took 15m 47s. All five IC14 cases timed out, and the store took roughly two minutes to reopen after each timeout.
+> - **GraphQLite took 24m 36s.** Import took 11m 50s, and 16 cases timed out across four operations.
+>
+> For targeted testing, pass `--engine` for each engine you want to include. This lets you skip Relate and GraphQLite when the test does not need them.
 
 Give each run a fresh output directory. To turn the saved results into a leaderboard, run this command.
 
@@ -57,15 +65,16 @@ just all --dry-run
 just all --out results/full-matrix
 ```
 
-`just all` runs SNB Interactive and FinBench at SF1 and SF10 across all eight engines. Both commands use the read sweep by default. Add `--mixed` to append updates. `--max-updates` caps the source update prefix before operation filtering, so a selected write may need a longer prefix to appear. The timeout, thread, batch size, and deviation pack options are listed by `just selected --help`. Use `--skip-fetch` to run against already extracted datasets and `--data-root` to choose the cache location.
+`just all` runs SNB Interactive and FinBench at SF1 and SF10 on eight default engines. They are ArcadeDB, Grafeo, GraphDBLite, Kùzu, Ladybug, Relate, RyuGraph, and Velr. Both matrix commands use the read sweep by default. Add `--mixed` to append updates. `--max-updates` caps the source update prefix before operation filtering, so a selected write may need a longer prefix to appear. The timeout, thread, batch size, and deviation pack options are listed by `just selected --help`. Use `--skip-fetch` to run against already extracted datasets and `--data-root` to choose the cache location.
 
 `--dry-run` prints the plan inside the benchmark image. The recipe builds the image on first use. Each workload writes to its own directory under `--out`. The top-level `matrix.json` and `matrix-summary.jsonl` record the plan and outcomes. The matrix continues to later workloads when a workload fails and returns a nonzero exit code if a workload could not finish. Use a fresh output directory for each run.
 
-GraphQLite 1.0.0 and NeuG 0.3.1 are opt-in candidates included in the image. This command replays the existing SF1 reference schedule on both candidates.
+The suite supports **TuGraph** and **NeuG** as opt-in engines because both failed most queries in the canonical SNB SF1 run. TuGraph verified **6 of 105** cases and NeuG verified **5 of 105**. Each fully verified just one of the 21 read operations, IS1. Both loaders use a single label per node, which affects canonical queries that rely on shared SNB labels. [TuGraph schema notes](deviations/README.md#snapshot-wiring) · [NeuG loader](#snapshot-loading)
+
+Run both engines against the checked-in five-input SF1 reference with explicit selections.
 
 ```sh
-just selected --workload snb-sf1 --engine graphqlite --engine neug \
-    --reference snb-sf1=references/snb-sf1.json --out results/snb-candidates
+just sf1-cohort-quick results/snb-sf1-opt-in --engine tugraph --engine neug
 ```
 
 The runner executes one engine at a time. Use `--trials N` to repeat a run with the same case schedule. The first trial uses the selected order, and each later trial moves the first engine to the end. A full rotation gives every engine one turn in each position. `trials.json` lists the trial directories and their orders. Each trial records its order in `run.json` and writes engine outcomes in execution order to `summary.jsonl`. `just chart --run` accepts the parent directory. For a leaderboard, point `--run` at an individual trial directory.

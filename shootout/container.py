@@ -88,7 +88,6 @@ def main():
         return subprocess.call([*docker, "run", "--rm", "--init", "--platform", target,
                                 "--user", f"{os.getuid()}:{os.getgid()}", *workspace_mounts(),
                                 "--workdir", str(ROOT), "--env", "HOME=/tmp",
-                                "--env", "RELATE_EXPRESSION_MEMORY_LIMIT=512mib",
                                 "--env", f"SHOOTOUT_CONTAINER_PLATFORM={target}",
                                 "--env", f"SHOOTOUT_CONTAINER_IMAGE={image_id}", image_id, *command])
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
