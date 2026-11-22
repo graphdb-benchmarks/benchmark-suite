@@ -12,7 +12,7 @@ The Python runner replays the same published Cypher queries against embedded and
 
 Install `just`, CPython 3.12, and Docker with a Linux runtime. `just setup` builds the pinned benchmark image for the Docker host's CPU, choosing Linux ARM64 or Linux x86-64. The launcher checks the image, Python, and server executables against that architecture. Set `SHOOTOUT_DOCKER_CONTEXT` to choose a Docker context. On macOS, give the Docker VM enough RAM to enforce the 15 GB default RSS cap, for example 18 GiB.
 
-Each benchmark invocation runs all selected engines in one container. The image installs the pinned PyPI drivers and the published server and loader binaries, including `velr-admin` 0.2.61. The runner stages each dataset once on the container's Linux filesystem before timing any engine and creates a fresh store per engine. It saves evidence to the workspace and records the image ID, architecture, CPU count, and visible host memory in `run.json`. [Velr CLI releases](https://github.com/velr-ai/velr/releases)
+Each benchmark invocation runs all selected engines in one container. The image includes the pinned PyPI drivers and the published server and loader binaries required by the engines. The runner stages each dataset once on the container's Linux filesystem before timing any engine and creates a fresh store per engine. It saves results to the workspace and records the image ID, architecture, CPU count, and visible host memory in `run.json`.
 
 Input and output paths under the repository are shared with the container. For paths outside the repository, set `SHOOTOUT_DOCKER_MOUNTS` to a colon-separated list of existing host directories.
 
@@ -25,7 +25,7 @@ just sf1-cohort results/snb-sf1-cohort
 
 The smoke run downloads the public fixtures, loads the same logical snapshot in each engine, and exercises a small set of canonical reads. It records query refusals, mismatches, and timeouts as benchmark outcomes. It uses smaller inputs and shorter time limits than the scale runs. Use a new output directory for each run, such as `just smoke results/smoke-repeat`.
 
-`just sf1-cohort` runs the ten engines in the SF1 leaderboard, starting with Velr. It verifies the default case schedule against the checked-in expected answers. Give it a new output directory for each run. To turn the saved results into a leaderboard, run:
+`just sf1-cohort` runs the ten engines in the SF1 comparison and verifies results against the checked-in expected answers. Give it a new output directory for each run. To turn the saved results into a leaderboard, run:
 
 ```sh
 just leaderboard --run results/snb-sf1-cohort --out results/snb-sf1-leaderboard.html
@@ -38,7 +38,7 @@ just finbench 1 results/finbench-sf1
 just finbench 10 results/finbench-sf10
 ```
 
-Append `--engine velr` to any recipe above to run one engine. For a custom selection, `just selected` accepts repeated `--workload`, `--engine`, and `--op` flags. Use the published workload operation IDs, such as `IS1` or `TSR1`.
+Use `--engine` to choose an engine for a run. For a custom selection, `just selected` accepts repeated `--workload`, `--engine`, and `--op` flags. Use the published workload operation IDs, such as `IS1` or `TSR1`.
 
 ```sh
 just selected --workload snb-sf1 --engine velr --op IS1 --per-read 1 --out results/velr-is1
@@ -58,7 +58,7 @@ just selected --workload snb-sf1 --engine graphqlite --engine neug \
     --reference snb-sf1=references/snb-sf1.json --out results/snb-candidates
 ```
 
-The runner executes one engine at a time and starts each workload with Velr whenever it is selected. The remaining engines follow the requested order. The default RSS cap is **15 GB** (15 billion bytes) per worker and its subprocesses, including `velr-admin`. Every replay query has the same **30-second** external wall-clock deadline through result consumption. Use `--rss-limit-gb` and `--query-timeout` to change the caps for every selected engine and workload. The `--timeout` option covers all work for one engine, including initial load and any restarts, and defaults to two hours.
+The runner executes one engine at a time. The plan and `run.json` record the execution order. The default RSS cap is **15 GB** (15 billion bytes) per worker and its subprocesses. Every replay query has the same **30-second** external wall-clock deadline through result consumption. Use `--rss-limit-gb` and `--query-timeout` to change the caps for every selected engine and workload. The `--timeout` option covers all work for one engine, including initial load and any restarts, and defaults to two hours.
 
 ```sh
 just all --rss-limit-gb 24 --query-timeout 90 --out results/full-matrix-24gb-90s
@@ -115,18 +115,18 @@ The FinBench TCR10 deviation replaces Neo4j GDS's Jaccard function with standard
 
 ## Snapshot loading
 
-The loaders share the same input schema, data normalization and snapshot checks. Import wall time and peak RSS cover preparation, loading, index creation, and closing the loaded store. Peak RSS includes the worker and any loader subprocesses, including `velr-admin`. Startup, reopen, and post-load verification are separate measurements. The plan, settings and worker events record the chosen loader. Each store starts empty.
+The loaders share the same input schema, data normalization and snapshot checks. Import wall time and peak RSS cover preparation, loading, index creation, and closing the loaded store. Peak RSS includes the worker and its loader subprocesses. Startup, reopen, and post-load verification are separate measurements. The plan, settings and worker events record the chosen loader. Each store starts empty.
 
 | Engine | Snapshot loader |
 | --- | --- |
-| Velr | Strict offline `velr-admin import` using staged typed CSV. The load event includes CSV staging time, native import time, importer version and binary hash, and child-process peak RSS. |
-| Ladybug, Kùzu, RyuGraph | `COPY FROM` with staged Parquet. The column types preserve numbers, lists and nulls, and each relationship file has one source and target type. [Ladybug Parquet import](https://docs.ladybugdb.com/import/parquet/) |
-| Grafeo | Native typed CSV loads for scalar node fields and edges. Native node batches preserve list-valued fields. [Grafeo import APIs](https://docs.grafeo.dev/languages/python/database/#data-import) |
 | ArcadeDB | Native `graph_batch()` with the write-ahead log enabled, serial flushing, and one commit per flush. The runner verifies the persisted edge counts after reopening. [ArcadeDB bulk loads](https://docs.arcadedb.com/arcadedb-python/how-to/bulk-loads) |
+| Grafeo | Native typed CSV loads for scalar node fields and edges. Native node batches preserve list-valued fields. [Grafeo import APIs](https://docs.grafeo.dev/languages/python/database/#data-import) |
 | GraphDBLite | Native node and edge batches. Batched Cypher creates nodes with multiple labels in one operation. The loader resolves relationship endpoints in batches through a temporary SQLite index. |
-| Relate | Parameterized `UNWIND` batches through the embedded Python driver. [Relate Python ingestion guide](https://graphacademy.neo4j.com/courses/relate-get-started-python/1-install-load-and-query/3-seed-data) |
 | GraphQLite | `insert_nodes_bulk` and `insert_edges_bulk` with the returned endpoint ID map. A final SQLite transaction removes the temporary text IDs and adds the shared SNB labels, preserving numeric `id` properties and one node per input row. [Bulk import API](https://colliery-io.github.io/graphqlite/how-to/bulk-import/), [SQLite storage schema](https://colliery-io.github.io/graphqlite/reference/database-schema/) |
+| Kùzu, Ladybug, RyuGraph | `COPY FROM` with staged Parquet. The column types preserve numbers, lists and nulls, and each relationship file has one source and target type. [Ladybug Parquet import](https://docs.ladybugdb.com/import/parquet/) |
 | NeuG | Embedded `COPY FROM` on typed CSV, with node and relationship table creation and copies grouped in one explicit transaction. Nodes use one physical label, so canonical reads that require the shared `Message`, `Place`, or `Organisation` labels can fail. [NeuG bulk import](https://neug.io/docs/data_io/import_data/) |
+| Relate | Parameterized `UNWIND` batches through the embedded Python driver. [Relate Python ingestion guide](https://graphacademy.neo4j.com/courses/relate-get-started-python/1-install-load-and-query/3-seed-data) |
+| Velr | Offline import of staged typed CSV with `velr-admin` 0.2.61. The load event records staging time, import time, importer version and binary hash, and child-process peak RSS. [Velr CLI releases](https://github.com/velr-ai/velr/releases) |
 
 GraphDBLite 0.2.0 caps the intermediate rows in a Cypher scan at 100,000. The runner verifies the same node and edge counts by reading the reopened SQLite store in read-only mode through Python. Every timed Cypher operation still runs through the pinned GraphDBLite driver.
 
