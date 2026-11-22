@@ -107,6 +107,8 @@ def engine_results(engine, directory, settings, listed, reference, queries):
     worker_status = summary.get("status", "No worker summary")
     case_rss = summary.get("case_peak_sampled_query_rss_bytes", {})
     observations, worker, imported = {}, {}, {}
+    first_after_restart = set()
+    restart_pending = False
     event_file = directory / f"{engine}.jsonl"
     if event_file.exists():
         for _, event in cases(event_file, allow_interrupted_line=worker_status != "complete"):
@@ -114,6 +116,11 @@ def engine_results(engine, directory, settings, listed, reference, queries):
                 worker = event
             if event["event"] == "load":
                 imported = event
+            if event["event"] == "resume":
+                restart_pending = True
+            elif restart_pending and event["event"] == "case_start":
+                first_after_restart.add(event["case"])
+                restart_pending = False
             if event["event"] != "case":
                 continue
             number = event["case"]
@@ -137,6 +144,7 @@ def engine_results(engine, directory, settings, listed, reference, queries):
         verdict, duration, reason = outcome(event, item, expected, cap_ns, worker_status)
         deviation = planned.get("deviation") if event.get("executed_sha256") and verdict != "omitted" else None
         rows[number] = {"outcome": verdict, "duration_ns": duration, "reason": reason,
+                        "first_after_restart": number in first_after_restart,
                         "peak_query_rss_bytes": case_rss.get(str(number)),
                         "query_pack": deviation["pack"] if deviation else None,
                         "executed_sha256": event.get("executed_sha256") if verdict != "omitted" else None}
@@ -378,6 +386,8 @@ def operation_chart(operation, inputs, engines, deadline, anchor):
             label = {"pass": "PASS", "timeout": "TIMEOUT", "fail": "FAIL", "omitted": "OMIT"}[verdict]
             name = NAMES[engine["name"]]
             reason = escape(result["reason"])
+            if result.get("first_after_restart"):
+                reason += " · First case after worker restart"
             variant = escape(result.get("query_pack") or ("Canonical" if result.get("executed_sha256") else "—"))
             elapsed = latency_label(duration) if duration is not None else "—"
             rss = result.get("peak_query_rss_bytes")

@@ -114,7 +114,7 @@ For Neo4j, the runner applies the heap and page cache values recommended by `neo
 
 TuGraph uses single-label vertices and stores the SNB string arrays as JSON strings. The runner uses the driver's REST transport with bound parameters and verifies the canonical queries against the same expected rows. [TuGraph schema and transport notes](deviations/README.md)
 
-The same supervisor enforces each query deadline outside the database process, including for drivers that lack cancellation. After a timed-out read it kills the process group, records the timeout, and reopens the same persistent snapshot in a fresh worker to continue at the next case. A timed-out write stops replay for that engine because its commit outcome may be unknown. Resume events identify the connection changes so timing comparisons can use cases measured in matching conditions.
+The same supervisor enforces each query deadline outside the database process, including for drivers that lack cancellation. After a timed-out read it kills the process group, records the timeout, and reopens the same persistent snapshot in a fresh worker to continue at the next case. A timed-out write stops replay for that engine because its commit outcome may be unknown. The case appendix and leaderboard details flag the first attempted case after each worker restart.
 
 Each recipe downloads and caches the official datasets and parameters under `data/`. SNB uses the Interactive v1 **CsvComposite & LongDateFormatter** archives. FinBench uses its published transaction snapshots. Downloads print SHA-256 hashes. Leave room for the cached archives, extracted CSVs, and one engine's working database at a time. SF10 can take hours depending on the machine, engine, and query limits. [SNB datasets](https://ldbcouncil.org/benchmarks/snb/datasets/), [FinBench datasets](https://ldbcouncil.org/benchmarks/finbench/datasets/)
 
@@ -213,16 +213,16 @@ just leaderboard --run results/snb-sf1 --out results/snb-sf1-leaderboard.html \
     --json results/snb-sf1-scores.json
 ```
 
-An operation earns up to three points based on its nearest-rank p99. Every measured attempt must pass verification to earn points. The standings sum the unrounded operation scores and show how many operations each engine verified.
+An operation earns up to three points based on its nearest-rank p99. Wrong results, query errors, and missing measurements disqualify the operation. A timeout contributes a sample at the query deadline. If p99 lands on a timeout, the report shows the deadline as a lower bound and awards zero points. The standings sum the unrounded scores and show how many operations each engine fully verified.
 
-| Verified p99 | Points per operation |
+| Measured p99 | Points per operation |
 | --- | ---: |
 | 2.5 s or slower | 0 |
 | 15 ms or faster | 3 |
 
-Between these endpoints, points follow `3 × log(2500 / p99_ms) / log(2500 / 15)`. Equal proportional improvements earn equal point gains. With 500 verified measurements per operation, nearest-rank p99 is the 495th value in ascending order. With fewer than 100 measurements it is the maximum. The operation details show scheduled measurements, verified responses, timeouts, p99, and median. The standings also show the geometric mean of p99 across the operations fully verified by every engine, along with the shared operation IDs and coverage. Operations omitted by every engine are outside the report. The operation charts include query RSS and import measurements.
+Between these endpoints, points follow `3 × log(2500 / p99_ms) / log(2500 / 15)`. Equal proportional improvements earn equal point gains. With 500 measurements per operation, nearest-rank p99 is the 495th value in ascending order. Six timeouts put p99 at the deadline. With fewer than 100 measurements, p99 is the maximum. The operation details show scheduled measurements, verified responses, timeouts, cases that follow a restart, p99, and the median of verified responses. The standings also show the geometric mean of p99 across the operations fully verified by every engine, along with the shared operation IDs and coverage. Operations omitted by every engine are outside the report. The operation charts include query RSS and import measurements.
 
-Repeat `--run` to combine engines from separate result directories. Each engine needs one source, and the runs must match on workload, scale, case schedule, expected answers, platform, Python version, and limits. Use `--exclude-engine` to leave an engine out of the cohort. The JSON records the scoring endpoints, each fully verified operation's p99, the awarded points, and the operations used in the geometric mean.
+Repeat `--run` to combine engines from separate result directories. Each engine needs one source, and the runs must match on workload, scale, case schedule, expected answers, platform, Python version, and limits. Use `--exclude-engine` to leave an engine out of the cohort. The JSON records the scoring endpoints, each eligible operation's p99 and whether it is a lower bound, cases that follow a restart, awarded points, and the operations used in the geometric mean.
 
 Use `--cohort NAME=DIR` to display multiple platform rankings on the same page. Repeat a name to supply several runs for that platform. Each cohort shares the workload, case schedule, expected answers, and caps. The JSON export contains a `cohorts` array with the standings and operation scores for each platform.
 

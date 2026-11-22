@@ -34,8 +34,8 @@ def load_cohort(directories, reference, excluded):
     return report, settings["cases_sha256"]
 
 
-def scoring_latency(p99_ns):
-    if p99_ns is None:
+def scoring_latency(p99_ns, p99_is_lower_bound):
+    if p99_ns is None or p99_is_lower_bound:
         return ZERO_LATENCY_SCORE_NS
     return min(ZERO_LATENCY_SCORE_NS, max(FULL_LATENCY_SCORE_NS, p99_ns))
 
@@ -55,22 +55,29 @@ def score_workload(report):
         entries = []
         for row in rows:
             name = row["engine"]
-            correct = row["outcomes"]["pass"] == row["cases"]
+            counts = row["outcomes"]
             recorded = engines[name]["cases"]
-            durations = sorted(recorded[number]["duration_ns"] for number in numbers) if correct else []
-            p99 = durations[(99 * len(durations) - 1) // 100] if durations else None
-            fraction = log(ZERO_LATENCY_SCORE_NS / scoring_latency(p99)) / LOG_LATENCY_RANGE
-            entry = {**row, "total": MAX_POINTS_PER_OPERATION * fraction, "p99_ns": p99}
+            p99, lower_bound = None, False
+            if numbers and counts["pass"] + counts["timeout"] == row["cases"]:
+                # A completed response at the deadline sorts before a censored response.
+                samples = sorted((recorded[number]["duration_ns"], recorded[number]["outcome"] == "timeout")
+                                 for number in numbers)
+                p99, lower_bound = samples[(99 * len(samples) - 1) // 100]
+            fraction = log(ZERO_LATENCY_SCORE_NS / scoring_latency(p99, lower_bound)) / LOG_LATENCY_RANGE
+            entry = {**row, "total": MAX_POINTS_PER_OPERATION * fraction, "p99_ns": p99,
+                     "p99_is_lower_bound": lower_bound,
+                     "first_after_restart_cases": [number for number in numbers if recorded[number].get("first_after_restart")]}
             scores[name].append(entry)
             entries.append(entry)
-        if all(row["p99_ns"] is not None for row in entries):
+        if all(row["outcomes"]["pass"] == row["cases"] for row in entries):
             common_operations.append(operation)
             for row in entries:
                 common_p99s[row["engine"]].append(row["p99_ns"])
         categories[operation] = entries
 
     # A sum of logarithms ranks by the corresponding integer product, so exact ties stay tied.
-    ranking = sorted((prod(scoring_latency(row["p99_ns"]) for row in rows), name) for name, rows in scores.items())
+    ranking = sorted((prod(scoring_latency(row["p99_ns"], row["p99_is_lower_bound"]) for row in rows), name)
+                     for name, rows in scores.items())
     standings = []
     previous = None
     for index, (product, name) in enumerate(ranking, 1):
@@ -85,7 +92,7 @@ def score_workload(report):
         standings.append({"rank": rank, "engine": name, "version": engine["version"], "source": engine["directory"],
                           "deployment": engine.get("deployment", "embedded"),
                           "query_packs": engine.get("query_packs", []), "engine_settings": engine.get("engine_settings", {}),
-                          "verified_operations": sum(row["p99_ns"] is not None for row in scores[name]),
+                          "verified_operations": sum(row["outcomes"]["pass"] == row["cases"] for row in scores[name]),
                           "total": fsum(row["total"] for row in scores[name]),
                           "common_geomean_p99_ns": shared_p99})
     host = next((engine for engine in report["engines"] if engine.get("platform")), {})
@@ -154,15 +161,22 @@ def render_cohort(score, anchor):
             counts = row["outcomes"]
             time = latency_label(row["median_verified_ns"]) if row["median_verified_ns"] is not None else "—"
             p99 = latency_label(row["p99_ns"]) if row["p99_ns"] is not None else "—"
+            if row["p99_is_lower_bound"]:
+                p99 = f"≥{p99}"
             peak = rss_label(row["peak_query_rss_bytes"]) if row["peak_query_rss_bytes"] is not None else "—"
             packs = escape(", ".join(row.get("query_packs", ())) or "Canonical")
+            restart_cases = row["first_after_restart_cases"]
+            restarts = "—"
+            if restart_cases:
+                case_numbers = ", ".join(map(str, restart_cases))
+                restarts = f'<details><summary>{len(restart_cases)}</summary>{case_numbers}</details>'
             entries.append(f'<tr><th scope="row">{NAMES[row["engine"]]}</th><td>{packs}</td><td>{counts["pass"]}/{row["cases"]}</td>'
-                           f'<td>{counts["timeout"]}</td><td>{p99}</td><td>{time}</td>'
+                           f'<td>{counts["timeout"]}</td><td>{restarts}</td><td>{p99}</td><td>{time}</td>'
                            f'<td>{peak} ({row["rss_cases"]}/{row["cases"]})</td>'
                            f'<td>{points_label(row["total"])}</td></tr>')
         details.append(f'<details><summary>{escape(operation)} · {rows[0]["cases"]} scheduled measurements per engine</summary>'
                        '<table><thead><tr><th>Engine</th><th>Query variant</th><th>Verified</th><th>Timeouts</th>'
-                       '<th>Verified p99</th><th>Verified median</th><th>Peak RSS (coverage)</th>'
+                       '<th>First after restart</th><th>p99</th><th>Verified median</th><th>Peak RSS (coverage)</th>'
                        '<th>Points</th></tr></thead>'
                        f'<tbody>{"".join(entries)}</tbody></table></details>')
     common = score["common_operations"]
@@ -172,8 +186,8 @@ def render_cohort(score, anchor):
 <p>{len(score['categories'])} scored operations · {score['max_points']} possible points per engine{evidence}{cpu_description(score)}</p>
 <div class="plot">{score_chart(score)}</div>
 <div class="table"><table><thead><tr><th>Rank</th><th>Engine</th><th>Deployment</th><th>Query packs</th><th>Total points</th>
-<th>Verified operations</th><th>Shared p99 geometric mean</th></tr></thead><tbody>{''.join(standings)}</tbody></table></div>
-<p>The geometric mean uses {len(common)} of {len(score['categories'])} scored operations with a verified p99 on every engine{common_detail}.</p>
+<th>Fully verified operations</th><th>Shared p99 geometric mean</th></tr></thead><tbody>{''.join(standings)}</tbody></table></div>
+<p>The geometric mean uses {len(common)} of {len(score['categories'])} scored operations with every case verified on every engine{common_detail}.</p>
 <details><summary>Points by operation</summary>{''.join(details)}</details></section>'''
 
 
@@ -203,11 +217,13 @@ details{margin:.5rem 0}summary{cursor:pointer;font-weight:650}
 <p>{score['deadline_seconds']:g} s query deadline · {score['rss_limit_bytes'] / 1e9:g} GB RSS cap</p>
 {navigation}{sections}
 <section><h2>Scoring rules</h2>
-<p>All scheduled measurements for an operation must pass verification to earn points.
-A verified nearest-rank p99 earns 0 points at {zero_latency} or slower and {score['max_points_per_operation']} points
+<p>Wrong results, errors, and missing measurements disqualify an operation.
+Timeouts count as samples at the query deadline. When p99 lands on a timeout, the deadline is displayed as a lower bound and scores zero.
+A measured nearest-rank p99 earns 0 points at {zero_latency} or slower and {score['max_points_per_operation']} points
 at {full_latency} or faster. Points increase logarithmically between those endpoints.
 Rank uses the sum of unrounded points across operations.</p>
-<p>Each operation shows its scheduled measurement count. Below 100 verified measurements, nearest-rank p99 is the maximum.
+<p>Each operation shows its scheduled measurement count and flags the first attempted case after each worker restart.
+Below 100 measurements, nearest-rank p99 is the maximum.
 Operations omitted by every engine are outside the report.</p>
 </section></main></html>
 '''

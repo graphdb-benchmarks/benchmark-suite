@@ -9,7 +9,7 @@ def measurement(engine, *, passed=5, failed=0, omitted=0, latency=15, peak=20, s
             "outcomes": {"pass": passed, "fail": failed, "timeout": cases - passed - failed - omitted, "omitted": omitted}}
 
 
-def workload(operations):
+def workload(operations, *, deadline_seconds=30):
     cases = {row["engine"]: {} for rows in operations.values() for row in rows}
     schedule = {}
     offset = 1
@@ -20,16 +20,16 @@ def workload(operations):
         for row in rows:
             outcomes = [outcome for outcome, count in row["outcomes"].items() for _ in range(count)]
             for number, outcome in zip(numbers, outcomes, strict=True):
-                duration = row["median_verified_ns"] if outcome == "pass" else 1
+                duration = deadline_seconds * 1_000_000_000 if outcome == "timeout" else row["median_verified_ns"]
                 cases[row["engine"]][number] = {"outcome": outcome, "duration_ns": duration}
-    return {"workload": "snb-sf1", "reference": None, "deadline_seconds": 30, "rss_limit_bytes": 15_000_000_000,
+    return {"workload": "snb-sf1", "reference": None, "deadline_seconds": deadline_seconds, "rss_limit_bytes": 15_000_000_000,
             "engines": [{"name": name, "version": "1.0", "directory": "run/snb-sf1", "cases": rows}
                         for name, rows in cases.items()],
             "operations": schedule, "aggregates": operations}
 
 
 class Leaderboard(unittest.TestCase):
-    def test_wrong_and_timed_out_cases_earn_zero(self):
+    def test_wrong_results_disqualify_and_a_timeout_is_the_maximum_of_five(self):
         report = workload({"IC1": [
             measurement("velr", latency=80, peak=70),
             measurement("grafeo", latency=2_500_000_000),
@@ -39,8 +39,10 @@ class Leaderboard(unittest.TestCase):
         result = score_workload(report)
         standings = {row["engine"]: (row["total"], row["verified_operations"]) for row in result["standings"]}
         self.assertEqual(standings, {"velr": (3, 1), "grafeo": (0, 1), "graphqlite": (0, 0), "relate": (0, 0)})
-        p99s = {row["engine"]: row["p99_ns"] for row in result["categories"]["IC1"]}
-        self.assertEqual(p99s, {"velr": 80, "grafeo": 2_500_000_000, "graphqlite": None, "relate": None})
+        p99s = {row["engine"]: (row["p99_ns"], row["p99_is_lower_bound"]) for row in result["categories"]["IC1"]}
+        self.assertEqual(p99s, {"velr": (80, False), "grafeo": (2_500_000_000, False),
+                                "graphqlite": (None, False), "relate": (30_000_000_000, True)})
+        self.assertIn("≥30 s", render(result))
 
     def test_rss_measurements_do_not_affect_the_score(self):
         report = workload({
@@ -67,6 +69,40 @@ class Leaderboard(unittest.TestCase):
         self.assertEqual(score["p99_ns"], 15_000_000)
         self.assertEqual(score["total"], 3)
         self.assertIn("500 scheduled measurements", render(result))
+
+    def test_expanded_sample_includes_timeouts_at_the_deadline(self):
+        report = workload({"IC1": [
+            measurement("velr", passed=499, cases=500, latency=15_000_000),
+            measurement("grafeo", passed=495, cases=500, latency=15_000_000),
+            measurement("relate", passed=494, cases=500, latency=15_000_000),
+            measurement("graphqlite", passed=498, failed=1, cases=500, latency=15_000_000),
+        ]})
+        report["engines"][1]["cases"][18]["first_after_restart"] = True
+        report["engines"][1]["cases"][495]["duration_ns"] = 16_000_000
+        result = score_workload(report)
+        operations = result["categories"]["IC1"]
+        self.assertEqual([(row["p99_ns"], row["p99_is_lower_bound"]) for row in operations], [
+            (15_000_000, False), (16_000_000, False), (30_000_000_000, True), (None, False),
+        ])
+        self.assertEqual([operations[index]["total"] for index in (0, 2, 3)], [3, 0, 0])
+        self.assertTrue(0 < operations[1]["total"] < 3)
+        self.assertEqual(operations[1]["first_after_restart_cases"], [18])
+        self.assertIn("<details><summary>1</summary>18</details>", render(result))
+        self.assertEqual([row["verified_operations"] for row in result["standings"]], [0, 0, 0, 0])
+        self.assertEqual(result["common_operations"], [])
+
+    def test_censored_p99_earns_zero_at_a_shorter_deadline(self):
+        report = workload({"IC1": [
+            measurement("grafeo", passed=0, latency=None),
+            measurement("velr", latency=1_000_000_000),
+        ]}, deadline_seconds=1)
+        result = score_workload(report)
+        rows = result["categories"]["IC1"]
+        self.assertEqual([(row["p99_ns"], row["p99_is_lower_bound"]) for row in rows],
+                         [(1_000_000_000, True), (1_000_000_000, False)])
+        self.assertEqual(rows[0]["total"], 0)
+        self.assertGreater(rows[1]["total"], 0)
+        self.assertEqual([row["engine"] for row in result["standings"]], ["velr", "grafeo"])
 
     def test_latency_points_are_logarithmic_between_the_anchors(self):
         latencies_ns = [0, 15_000_000, 30_000_000, 60_000_000, 193_649_167, 2_500_000_000, 3_000_000_000]

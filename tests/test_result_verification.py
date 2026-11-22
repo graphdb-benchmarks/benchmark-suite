@@ -13,7 +13,7 @@ from shootout.cases import write_case_file
 from shootout.catalog import load
 from shootout.chart import aggregate, aggregate_chart, operation_chart, outcome, read_workload
 from shootout.reference import build_reference
-from shootout.run import cases, run_cases
+from shootout.run import cases, describe_case, run_cases
 from shootout.verification import equal_rows, load_reference, rows_digest
 
 
@@ -104,6 +104,38 @@ class ResultVerification(unittest.TestCase):
         self.assertEqual(chart.count("<rect"), 1)
         self.assertIn("×</text>", chart)
         self.assertIn("FAIL</text>", chart)
+
+    def test_report_flags_first_attempt_after_restart_from_saved_events(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            queries = load("snb")
+            listed = {number: {"op": "IS1", "params": {"personId": number}, "expected": []}
+                      for number in range(1, 7)}
+            del listed[2]["expected"]
+            schedule = "".join(json.dumps(item) + "\n" for item in listed.values()).encode()
+            (root / "cases.jsonl").write_bytes(schedule)
+            (root / "run.json").write_text(json.dumps({
+                "suite": "snb", "scale": "1", "cases_sha256": sha256(schedule).hexdigest(), "case_count": len(listed),
+                "engines": ["velr"], "packs": [], "query_timeout": 30, "rss_limit_bytes": 1,
+            }))
+            events = []
+            for number, status in enumerate(("timeout", "verification_error", "timeout", "verified", "verified", "error"), 1):
+                if number in (2, 4):
+                    events.append({"event": "resume", "case": number, "open_ns": 1})
+                if status != "verification_error":
+                    events.append({"event": "case_start", "case": number, "op": "IS1"})
+                row, _ = describe_case("snb", queries, number, listed[number])
+                events.append({**row, "status": status, "verification": "expected",
+                               "duration_ns": 30_000_000_000 if status == "timeout" else 1})
+            (root / "velr.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events))
+            report = read_workload(root, {}, None)
+            engine, = report["engines"]
+            self.assertEqual([number for number, row in engine["cases"].items() if row["first_after_restart"]], [3, 4])
+            self.assertEqual([engine["cases"][number]["outcome"] for number in (2, 3, 4, 6)],
+                             ["fail", "timeout", "pass", "fail"])
+            appendix = operation_chart("IS1", report["operations"]["IS1"], [engine], 30, "test")
+            self.assertIn("Case 3 · TIMEOUT · 30 s · External query deadline reached · First case after worker restart", appendix)
+            self.assertIn("Case 4 · PASS · 1 ns · Verified during replay · First case after worker restart", appendix)
 
     def test_operation_uses_verified_median_and_maximum_measured_rss(self):
         engine = {"name": "velr", "cases": {
